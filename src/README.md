@@ -40,7 +40,7 @@ continua funcionando se uma atualização do Micup der problema.
 
 ## Diagnóstico do compartilhamento de tela
 
-Com o Micup aberto, F12 > Console:
+Em Configurações › Desenvolvedor, ou com o Micup aberto em F12 > Console:
 
 ```js
 Miccord.screenShareEvents

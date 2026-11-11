@@ -8,18 +8,19 @@ itself when a new version is released.
 
 ## Features
 
-- Settings integrated into **Micup › Settings › Better MicUP** (plugins, themes, QuickCSS, logs)
+- Settings integrated into **Micup › Settings**, built with Micup's own switches and buttons:
+  Better MicUP, Plugins, Temas, Message Logger and Desenvolvedor pages
 - **Plugins**
-  - **ScreenShare Plus Bypass**: higher resolution, frame rate and bitrate for screen sharing
-  - **MessageLogger**: keeps deleted and edited messages visible
-  - **NoTrack**: turns off in-app reports and telemetry
-  - **CallTimer**: shows how long you have been in a call
-  - **Experiments**: developer options and hidden settings tabs
-  - **AlwaysTrustDomains & CleanURLs**: no external-link prompt, strips tracking parameters
-  - **DevTools**: F12 / Ctrl+Shift+I
+  - **ScreenShare Plus**: Plus resolutions and frame rates for screen sharing, higher bitrate
   - **Volume Booster**: per-user volume above 100%
+  - **Call Timer**: call duration next to the channel name in the voice panel
+  - **Message Logger**: keeps deleted messages and the previous text of edited ones
   - **Fake Plus**: emojis and stickers from any server
-- **Themes**: built-in presets plus a live QuickCSS editor
+  - **NoTrack**: turns off telemetry, analytics and in-app reports
+  - **Links Confiáveis**: no external-link prompt, optional tracking-parameter cleanup
+  - **Experiments**: Micup's developer mode and its Developer settings
+  - **Atalhos**: F12 / Ctrl+Shift+I for DevTools, Ctrl+Shift+M for these settings
+- **Themes**: built-in presets (or Micup's original look) plus a live QuickCSS editor
 - **Stays applied**: a small background watcher re-applies the mod after every Micup update,
   without touching Micup's own update and rollback state
 - **Signed auto-updates**: new versions install by themselves; only releases signed with the

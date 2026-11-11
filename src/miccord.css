@@ -1,42 +1,6 @@
 /* ============================================================================
- * Miccord v1.0.0 — Mac Style Black Obsidian Theme & Stylesheet for Micup
+ * Better MicUP stylesheet: preset themes, settings pages, small UI touches.
  * ============================================================================ */
-
-:root {
-  /* Apple Mac Black Obsidian Core Palette */
-  --miccord-bg-base: #000000;
-  --miccord-bg-surface-glass: rgba(20, 20, 24, 0.75);
-  --miccord-bg-surface-card: rgba(26, 26, 30, 0.65);
-  --miccord-bg-surface-card-hover: rgba(34, 34, 40, 0.78);
-  --miccord-bg-surface-elevated: rgba(38, 38, 44, 0.85);
-
-  --miccord-border: rgba(255, 255, 255, 0.09);
-  --miccord-border-subtle: rgba(255, 255, 255, 0.05);
-  --miccord-border-hover: rgba(255, 255, 255, 0.18);
-  --miccord-border-focus: rgba(255, 255, 255, 0.35);
-
-  --miccord-text-primary: #ffffff;
-  --miccord-text-secondary: #e4e4e7;
-  --miccord-text-muted: #94949e;
-  --miccord-text-faint: #63636e;
-
-  /* Mac System Colors */
-  --miccord-mac-blue: #0071e3;
-  --miccord-mac-green: #30d158;
-  --miccord-mac-red: #ff453a;
-  --miccord-mac-orange: #ff9f0a;
-
-  --miccord-accent: #ffffff;
-  --miccord-accent-text: #000000;
-
-  --miccord-radius-sm: 6px;
-  --miccord-radius-md: 10px;
-  --miccord-radius-lg: 14px;
-  --miccord-radius-pill: 999px;
-
-  --miccord-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-  --miccord-font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
-}
 
 /* ============================================================================
  * Built-in Preset Themes (applied via html[data-miccord-theme="..."])
@@ -137,665 +101,752 @@ html[data-miccord-theme="frost"] {
   --background-tertiary: #05080e !important;
 }
 
+
 /* ============================================================================
- * Mac Style UI Components & Layout
+ * Better MicUP settings pages — built to sit inside Micup's own settings modal.
+ * Colors and type come from Micup's theme variables, so the pages follow the
+ * active theme. Micup's own Switch/Button components are used when available;
+ * the .bmu-switch / .bmu-btn rules below only style the fallbacks.
  * ============================================================================ */
 
-.miccord-root {
-  color: var(--miccord-text-secondary);
-  font-family: var(--miccord-font-sans);
+.bmu-page {
+  --bmu-text: var(--text-primary, #f2f2f3);
+  --bmu-text-2: var(--text-secondary, #c7c7cc);
+  --bmu-text-3: var(--text-tertiary, #8d8d96);
+  --bmu-line: var(--background-modifier-accent, rgba(255, 255, 255, 0.08));
+  --bmu-surface: var(--background-secondary, rgba(255, 255, 255, 0.03));
+  --bmu-surface-2: var(--background-tertiary, rgba(255, 255, 255, 0.06));
+  --bmu-hover: var(--background-modifier-hover, rgba(255, 255, 255, 0.05));
+  --bmu-accent: var(--brand-primary, #7c5cff);
+  --bmu-on-accent: var(--brand-primary-fill, #fff);
+  --bmu-danger: var(--status-danger, #f04747);
+  --bmu-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding-bottom: 40px;
-  user-select: text;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-/* Minimalist Window Close Button (Right Side) */
-.miccord-modal-close-icon {
-  width: 28px;
-  height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: none;
-  border-radius: 6px;
-  color: var(--miccord-text-muted);
-  cursor: pointer;
-  transition: all 0.15s ease;
-  padding: 0;
-}
-
-.miccord-modal-close-icon:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: #ffffff;
-}
-
-.miccord-modal-close-icon:active {
-  transform: scale(0.92);
-}
-
-/* Mac Style Window Banner / Inspector Header */
-.miccord-hero {
-  position: relative;
-  overflow: hidden;
-  border-radius: var(--miccord-radius-lg);
-  padding: 18px 22px;
-  background: var(--miccord-bg-surface-glass);
-  backdrop-filter: blur(28px) saturate(190%);
-  -webkit-backdrop-filter: blur(28px) saturate(190%);
-  border: 1px solid var(--miccord-border);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 14px 36px rgba(0, 0, 0, 0.65);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.miccord-hero-left {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.miccord-hero-title {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 18px;
-  font-weight: 600;
-  letter-spacing: -0.015em;
-  color: var(--miccord-text-primary);
-  margin: 0;
-}
-
-.miccord-badge-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 2px 7px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  color: #d4d4d8;
-}
-
-.miccord-hero-sub {
-  font-size: 12px;
-  color: var(--miccord-text-muted);
-  margin: 0;
-  line-height: 1.45;
-}
-
-/* macOS Segmented Control (Pills Navigation) */
-.miccord-subnav {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  background: rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
-  padding: 3px;
-  gap: 2px;
-  width: fit-content;
-}
-
-.miccord-subnav-btn {
-  appearance: none;
-  background: transparent;
-  border: none;
-  color: rgba(255, 255, 255, 0.62);
-  border-radius: 7px;
-  padding: 6px 14px;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.miccord-subnav-btn:hover {
-  color: #ffffff;
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.miccord-subnav-btn.active {
-  background: rgba(255, 255, 255, 0.15);
-  color: #ffffff;
-  font-weight: 600;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.18);
-}
-
-/* Stats Overview Cards (macOS Widget Style) */
-.miccord-stats-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 10px;
-}
-
-.miccord-stat-card {
-  background: var(--miccord-bg-surface-card);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid var(--miccord-border);
-  border-radius: var(--miccord-radius-md);
-  padding: 13px 15px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  transition: all 0.15s ease;
-}
-
-.miccord-stat-card:hover {
-  border-color: var(--miccord-border-hover);
-  background: var(--miccord-bg-surface-card-hover);
-}
-
-.miccord-stat-value {
-  font-size: 18px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  color: var(--miccord-text-primary);
-  font-family: var(--miccord-font-mono);
-}
-
-.miccord-stat-label {
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--miccord-text-muted);
-}
-
-/* Search Toolbar */
-.miccord-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.miccord-search-input {
-  flex: 1;
-  min-width: 220px;
-  background: rgba(0, 0, 0, 0.35);
-  border: 1px solid var(--miccord-border);
-  border-radius: 8px;
-  padding: 8px 12px;
-  color: var(--miccord-text-primary);
-  font-size: 12.5px;
-  outline: none;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.miccord-search-input:focus {
-  border-color: rgba(255, 255, 255, 0.35);
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
-}
-
-.miccord-filter-group {
-  display: flex;
-  gap: 4px;
-}
-
-/* macOS Buttons */
-.miccord-btn {
-  appearance: none;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: var(--miccord-text-secondary);
-  border-radius: 7px;
-  padding: 6px 12px;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  transition: all 0.15s ease;
-}
-
-.miccord-btn:hover {
-  background: rgba(255, 255, 255, 0.14);
-  border-color: rgba(255, 255, 255, 0.18);
-  color: #ffffff;
-}
-
-.miccord-btn:active {
-  transform: scale(0.98);
-}
-
-.miccord-btn.primary {
-  background: #ffffff;
-  border-color: #ffffff;
-  color: #000000;
-  font-weight: 600;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
-}
-
-.miccord-btn.primary:hover {
-  background: #f0f0f2;
-}
-
-.miccord-btn.danger {
-  background: rgba(255, 69, 58, 0.14);
-  border-color: rgba(255, 69, 58, 0.28);
-  color: #ff6961;
-}
-
-.miccord-btn.danger:hover {
-  background: rgba(255, 69, 58, 0.24);
-  border-color: rgba(255, 69, 58, 0.45);
-  color: #ffffff;
-}
-
-/* Plugin Cards Grid (Mac Style) */
-.miccord-plugin-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 12px;
-}
-
-.miccord-plugin-card {
-  background: var(--miccord-bg-surface-card);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  border: 1px solid var(--miccord-border);
-  border-radius: var(--miccord-radius-md);
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  gap: 12px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 4px 14px rgba(0, 0, 0, 0.25);
-  transition: border-color 0.15s ease, background 0.15s ease;
-}
-
-.miccord-plugin-card:hover {
-  border-color: var(--miccord-border-hover);
-  background: var(--miccord-bg-surface-card-hover);
-}
-
-.miccord-plugin-card.enabled {
-  border-color: rgba(255, 255, 255, 0.14);
-  background: rgba(28, 28, 33, 0.72);
-}
-
-.miccord-plugin-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.miccord-plugin-title-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.miccord-plugin-name {
-  font-size: 13.5px;
-  font-weight: 600;
-  color: var(--miccord-text-primary);
-  display: flex;
-  align-items: center;
-  gap: 7px;
+  gap: 20px;
+  padding-bottom: 48px;
+  color: var(--bmu-text);
+  font-family: var(--font-sans, inherit);
+  font-size: 14px;
   line-height: 1.4;
 }
 
-.miccord-plugin-tag {
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 2px 6px;
-  border-radius: 5px;
-  background: rgba(255, 255, 255, 0.08);
-  color: #a1a1aa;
+.bmu-page.is-standalone {
+  gap: 16px;
 }
 
-.miccord-plugin-author {
-  font-size: 11px;
-  color: var(--miccord-text-faint);
-}
-
-.miccord-plugin-desc {
-  font-size: 12px;
-  color: var(--miccord-text-muted);
-  line-height: 1.45;
-  margin: 0;
-}
-
-/* Apple iOS/macOS Toggle Switch */
-.miccord-switch {
-  position: relative;
-  width: 38px;
-  height: 22px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.16);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  cursor: pointer;
-  transition: background 0.2s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s ease;
-  flex-shrink: 0;
-  padding: 0;
-}
-
-.miccord-switch.checked {
-  background: var(--miccord-mac-green);
-  border-color: #28b84d;
-}
-
-.miccord-switch.disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-}
-
-.miccord-switch-thumb {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #ffffff;
-  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.4);
-  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.miccord-switch.checked .miccord-switch-thumb {
-  transform: translateX(16px);
-}
-
-/* Plugin Inline Settings */
-.miccord-plugin-settings {
-  margin-top: 6px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.35);
-  border: 1px solid var(--miccord-border);
+/* Sections ------------------------------------------------------------------ */
+.bmu-section {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
 }
 
-.miccord-setting-row {
+.bmu-section-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  font-size: 11.5px;
-  color: var(--miccord-text-secondary);
+  gap: 12px;
 }
 
-.miccord-setting-input {
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid var(--miccord-border);
-  border-radius: 6px;
-  padding: 5px 8px;
-  color: var(--miccord-text-primary);
-  font-size: 11.5px;
-  outline: none;
-  min-width: 140px;
+.bmu-section-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--bmu-text);
 }
 
-.miccord-setting-select {
-  background-color: #141418 !important;
-  color: #ffffff !important;
-  border: 1px solid var(--miccord-border);
-  border-radius: 6px;
-  padding: 6px 30px 6px 10px;
-  font-size: 12px;
-  font-family: inherit;
-  font-weight: 500;
-  outline: none;
-  min-width: 160px;
-  cursor: pointer;
-  appearance: none;
-  -webkit-appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 10px center;
-  transition: border-color 0.15s ease, background-color 0.15s ease;
+.bmu-section-desc {
+  margin: -6px 0 0;
+  font-size: 13px;
+  color: var(--bmu-text-3);
 }
 
-.miccord-setting-select option,
-.miccord-setting-select optgroup {
-  background-color: #141418 !important;
-  color: #ffffff !important;
-  padding: 8px 10px;
-  font-size: 12px;
+.bmu-subtitle {
+  margin: 4px 0 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--bmu-text);
 }
 
-.miccord-setting-select option:hover,
-.miccord-setting-select option:focus,
-.miccord-setting-select option:checked {
-  background-color: #0071e3 !important;
-  color: #ffffff !important;
+.bmu-divider {
+  border: 0;
+  border-top: 1px solid var(--bmu-line);
+  margin: 4px 0;
+  width: 100%;
 }
 
-.miccord-setting-input:focus,
-.miccord-setting-select:focus {
-  border-color: var(--miccord-border-focus);
+.bmu-note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--bmu-text-3);
 }
 
-/* QuickCSS & Theme Grid */
-.miccord-theme-grid {
+.bmu-muted {
+  color: var(--bmu-text-3);
+}
+
+.bmu-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Header block on the main page ------------------------------------------- */
+.bmu-hero {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
+  border-radius: 12px;
+  background: var(--bmu-surface);
+  border: 1px solid var(--bmu-line);
+}
+
+.bmu-hero-icon {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-  gap: 10px;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border-radius: 10px;
+  color: var(--bmu-on-accent);
+  background: var(--bmu-accent);
 }
 
-.miccord-theme-card {
-  background: var(--miccord-bg-surface-card);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid var(--miccord-border);
-  border-radius: var(--miccord-radius-md);
-  padding: 12px;
-  cursor: pointer;
+.bmu-hero-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.bmu-hero-sub {
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--bmu-text-3);
+}
+
+.bmu-chip {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--bmu-text-2);
+  background: var(--bmu-surface-2);
+}
+
+/* Plugins --------------------------------------------------------------------- */
+.bmu-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.bmu-toolbar .bmu-input.is-search {
+  flex: 1 1 220px;
+}
+
+.bmu-plugin {
+  padding: 4px 0;
+}
+
+.bmu-plugin + .bmu-plugin {
+  border-top: 1px solid var(--bmu-line);
+  padding-top: 12px;
+}
+
+.bmu-plugin-options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 12px 0 4px 2px;
+  padding-left: 14px;
+  border-left: 2px solid var(--bmu-line);
+}
+
+.bmu-field {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  transition: border-color 0.15s ease;
 }
 
-.miccord-theme-card:hover {
-  border-color: var(--miccord-border-hover);
+.bmu-field-label {
+  font-size: 14px;
+  font-weight: 600;
 }
 
-.miccord-theme-card.active {
-  border-color: rgba(255, 255, 255, 0.35);
-  background: var(--miccord-bg-surface-card-hover);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+.bmu-field-desc {
+  margin-top: -4px;
+  font-size: 13px;
+  color: var(--bmu-text-3);
 }
 
-.miccord-theme-preview {
-  height: 48px;
-  border-radius: 7px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+/* Radio list (same look as Micup's "Spoiler content" options) ---------------- */
+.bmu-radio-list {
   display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  padding: 6px;
-  gap: 5px;
+  flex-direction: column;
+  gap: 4px;
 }
 
-.miccord-theme-swatch {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, 0.25);
-}
-
-.miccord-css-editor {
-  width: 100%;
-  min-height: 240px;
-  background: rgba(0, 0, 0, 0.45);
-  border: 1px solid var(--miccord-border);
+.bmu-radio {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 8px;
+  margin-left: -8px;
   border-radius: 8px;
-  padding: 12px;
-  color: #e4e4e7;
-  font-family: var(--miccord-font-mono);
-  font-size: 12px;
-  line-height: 1.55;
-  resize: vertical;
+  cursor: pointer;
+}
+
+.bmu-radio:hover {
+  background: var(--bmu-hover);
+}
+
+.bmu-radio input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.bmu-radio-dot {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border-radius: 50%;
+  border: 2px solid var(--bmu-text-3);
+  box-sizing: border-box;
+  transition: border-color 0.12s ease, border-width 0.12s ease;
+}
+
+.bmu-radio.is-checked .bmu-radio-dot {
+  border: 5px solid var(--bmu-accent);
+  background: var(--bmu-on-accent);
+}
+
+.bmu-radio input:focus-visible + .bmu-radio-dot {
+  outline: 2px solid var(--bmu-accent);
+  outline-offset: 2px;
+}
+
+.bmu-radio-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.bmu-radio-label {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.bmu-radio-desc {
+  font-size: 12.5px;
+  color: var(--bmu-text-3);
+}
+
+/* Segmented filter ------------------------------------------------------------ */
+.bmu-segmented {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--bmu-surface-2);
+}
+
+.bmu-segment {
+  appearance: none;
+  border: 0;
+  padding: 5px 12px;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--bmu-text-3);
+  background: transparent;
+  cursor: pointer;
+}
+
+.bmu-segment:hover {
+  color: var(--bmu-text);
+}
+
+.bmu-segment.is-active {
+  color: var(--bmu-text);
+  background: var(--bmu-hover);
+  box-shadow: inset 0 0 0 1px var(--bmu-line);
+}
+
+/* Inputs ------------------------------------------------------------------- */
+.bmu-input,
+.bmu-textarea {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--bmu-line);
+  background: var(--bmu-surface);
+  color: var(--bmu-text);
+  font: inherit;
+  font-size: 14px;
   outline: none;
 }
 
-.miccord-css-editor:focus {
-  border-color: var(--miccord-border-focus);
+.bmu-input:focus,
+.bmu-textarea:focus {
+  border-color: var(--bmu-accent);
 }
 
-/* ============================================================================
- * MessageLogger Minimalist Styles
- * ============================================================================ */
+.bmu-textarea {
+  min-height: 220px;
+  resize: vertical;
+}
 
-.miccord-msg-deleted-card {
-  background: rgba(255, 69, 58, 0.06);
-  border: 1px solid rgba(255, 69, 58, 0.18);
-  border-left: 3px solid #ff453a;
-  border-radius: 7px;
-  padding: 10px 14px;
-  margin-bottom: 8px;
+.bmu-textarea.is-short {
+  min-height: 96px;
+}
+
+.bmu-textarea.is-code {
+  font-family: var(--bmu-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  tab-size: 2;
+}
+
+.bmu-output {
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bmu-surface);
+  border: 1px solid var(--bmu-line);
+  font-family: var(--bmu-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Buttons (fallback + link buttons) ------------------------------------------ */
+.bmu-btn,
+.bmu-link-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 0;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  color: var(--bmu-text);
+  background: var(--bmu-surface-2);
+}
+
+.bmu-btn:hover,
+.bmu-link-btn:hover {
+  background: var(--bmu-hover);
+  text-decoration: none;
+}
+
+.bmu-btn.is-primary {
+  color: var(--bmu-on-accent);
+  background: var(--bmu-accent);
+}
+
+.bmu-btn.is-danger {
+  color: #fff;
+  background: var(--bmu-danger);
+}
+
+.bmu-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Switch fallback (Micup's own switch is used when found) ------------------- */
+.bmu-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.bmu-switch-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bmu-switch-label {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.bmu-switch-desc {
+  font-size: 13px;
+  color: var(--bmu-text-3);
+}
+
+.bmu-switch {
+  position: relative;
+  flex: none;
+  width: 40px;
+  height: 24px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--bmu-surface-2);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.bmu-switch.is-on {
+  background: var(--bmu-accent);
+}
+
+.bmu-switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s ease;
+}
+
+.bmu-switch.is-on .bmu-switch-thumb {
+  transform: translateX(16px);
+}
+
+/* Themes -------------------------------------------------------------------- */
+.bmu-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.bmu-theme {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--bmu-line);
+  background: var(--bmu-surface);
+  color: var(--bmu-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.bmu-theme:hover {
+  background: var(--bmu-hover);
+}
+
+.bmu-theme.is-selected {
+  border-color: var(--bmu-accent);
+  box-shadow: 0 0 0 1px var(--bmu-accent);
+}
+
+.bmu-theme-swatch {
+  display: flex;
+  height: 44px;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.bmu-theme-swatch > span {
+  flex: 1;
+}
+
+.bmu-theme-swatch > span:last-child {
+  flex: 0 0 22%;
+}
+
+.bmu-theme-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.bmu-theme-check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: var(--bmu-on-accent);
+  background: var(--bmu-accent);
+}
+
+/* Message Logger ------------------------------------------------------------ */
+.bmu-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bmu-surface);
+  border: 1px solid var(--bmu-line);
+  font-size: 13px;
+}
+
+.bmu-empty {
+  padding: 28px 16px;
+  border-radius: 10px;
+  border: 1px dashed var(--bmu-line);
+  text-align: center;
+  font-size: 13px;
+  color: var(--bmu-text-3);
+}
+
+.bmu-log-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.bmu-log {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  padding: 10px 12px;
+  border-left: 2px solid transparent;
 }
 
-.miccord-msg-edited-card {
-  background: rgba(255, 159, 10, 0.06);
-  border: 1px solid rgba(255, 159, 10, 0.18);
-  border-left: 3px solid #ff9f0a;
-  border-radius: 7px;
-  padding: 10px 14px;
-  margin-bottom: 8px;
+.bmu-log + .bmu-log {
+  border-top: 1px solid var(--bmu-line);
+}
+
+.bmu-log.is-deleted {
+  border-left-color: var(--bmu-danger);
+}
+
+.bmu-log.is-edited {
+  border-left-color: #f0b232;
+}
+
+.bmu-log-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.bmu-log-author {
+  font-weight: 600;
+}
+
+.bmu-log-tag {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--bmu-text-3);
+}
+
+.bmu-log.is-deleted .bmu-log-tag {
+  color: var(--bmu-danger);
+}
+
+.bmu-log.is-edited .bmu-log-tag {
+  color: #f0b232;
+}
+
+.bmu-log-where,
+.bmu-log-time {
+  font-size: 12px;
+  color: var(--bmu-text-3);
+}
+
+.bmu-log-time {
+  margin-left: auto;
+}
+
+.bmu-log-old {
+  font-size: 13.5px;
+  color: var(--bmu-text-3);
+  text-decoration: line-through;
+  white-space: pre-wrap;
+}
+
+.bmu-log-content {
+  font-size: 14px;
+  color: var(--bmu-text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bmu-log-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 12.5px;
+}
+
+/* Developer ------------------------------------------------------------------ */
+.bmu-event-list,
+.bmu-module-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  border-radius: 10px;
+  border: 1px solid var(--bmu-line);
+  overflow: hidden;
 }
 
-.miccord-badge-deleted {
-  display: inline-flex;
+.bmu-event,
+.bmu-module {
+  display: flex;
   align-items: center;
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: rgba(255, 69, 58, 0.18);
-  border: 1px solid rgba(255, 69, 58, 0.35);
-  color: #ff6961;
+  gap: 12px;
+  padding: 8px 12px;
+  font-size: 13px;
 }
 
-.miccord-badge-edited {
-  display: inline-flex;
-  align-items: center;
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: rgba(255, 159, 10, 0.18);
-  border: 1px solid rgba(255, 159, 10, 0.35);
-  color: #ffb340;
+.bmu-event + .bmu-event,
+.bmu-module + .bmu-module {
+  border-top: 1px solid var(--bmu-line);
 }
 
-/* ============================================================================
- * Standalone Overlay Modal (Ctrl+Shift+M) & Dynamic Island Floating Capsule
- * ============================================================================ */
+.bmu-event time {
+  flex: none;
+  width: 140px;
+  font-size: 12px;
+  color: var(--bmu-text-3);
+  font-variant-numeric: tabular-nums;
+}
 
+.bmu-module code {
+  flex: none;
+  min-width: 64px;
+  font-family: var(--bmu-mono);
+  font-size: 12px;
+}
+
+.bmu-module .bmu-muted {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.bmu-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--bmu-danger);
+}
+
+.bmu-error code {
+  font-family: var(--bmu-mono);
+  font-size: 12px;
+  color: var(--bmu-text-3);
+}
+
+/* Standalone window (Ctrl+Shift+M when the settings tabs aren't available) ---- */
 .miccord-modal-backdrop {
   position: fixed;
   inset: 0;
   z-index: 999990;
-  background: rgba(0, 0, 0, 0.68);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 24px;
-  animation: miccordFadeIn 0.18s ease-out;
+  background: rgba(0, 0, 0, 0.7);
 }
 
 .miccord-modal-window {
-  width: min(1040px, 95vw);
-  height: min(760px, 90vh);
-  background: rgba(18, 18, 22, 0.94);
-  backdrop-filter: blur(40px) saturate(190%);
-  -webkit-backdrop-filter: blur(40px) saturate(190%);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 16px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.15), 0 35px 90px rgba(0, 0, 0, 0.9);
   display: flex;
   flex-direction: column;
+  width: min(760px, 95vw);
+  height: min(760px, 90vh);
   overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid var(--background-modifier-accent, rgba(255, 255, 255, 0.1));
+  background: var(--background-primary, #111);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
 }
 
 .miccord-modal-topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 13px 18px;
-  background: rgba(26, 26, 30, 0.85);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--background-modifier-accent, rgba(255, 255, 255, 0.08));
+}
+
+.miccord-modal-close-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-tertiary, #aaa);
+  background: transparent;
+  cursor: pointer;
+}
+
+.miccord-modal-close-icon:hover {
+  color: var(--text-primary, #fff);
+  background: var(--background-modifier-hover, rgba(255, 255, 255, 0.06));
 }
 
 .miccord-modal-body {
   flex: 1;
   overflow-y: auto;
-  padding: 22px 26px;
-  background: rgba(14, 14, 17, 0.7);
+  padding: 20px 24px;
 }
 
-/* Dynamic Island Style Floating Capsule (Desativada) */
-.miccord-floating-widget {
-  display: none !important;
-}
-
-.miccord-pill-btn {
-  appearance: none;
-  background: transparent;
-  border: none;
-  color: #a1a1aa;
-  font-size: 11.5px;
-  font-weight: 500;
-  padding: 3px 8px;
-  border-radius: 999px;
-  cursor: pointer;
+/* Image lightbox buttons */
+.miccord-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  transition: background 0.15s ease, color 0.15s ease;
+  min-height: 32px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
+  cursor: pointer;
 }
 
-.miccord-pill-btn:hover {
-  background: rgba(255, 255, 255, 0.09);
-  color: #ffffff;
+.miccord-btn.primary {
+  color: #000;
+  background: #fff;
 }
 
-.miccord-pill-btn.active-success {
-  background: rgba(48, 209, 88, 0.15);
-  color: #30d158;
-  border: 1px solid rgba(48, 209, 88, 0.3);
+.miccord-btn.danger {
+  background: #d83c3e;
 }
 
-@keyframes miccordFadeIn {
-  from { opacity: 0; transform: scale(0.98); }
-  to { opacity: 1; transform: scale(1); }
+.miccord-floating-widget {
+  display: none !important;
 }
 
 /* ============================================================================
@@ -907,3 +958,15 @@ html[data-miccord-theme="midnight"] button[class*="Button_module__button"][class
 }
 
 
+
+/* CallTimer: call duration next to the channel name in the voice panel */
+.miccord-call-timer {
+  margin-left: 6px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+.miccord-call-timer::before {
+  content: "·";
+  margin-right: 6px;
+}

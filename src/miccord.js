@@ -15,7 +15,7 @@
   if (window.__MICCORD_INITIALIZED__) return;
   window.__MICCORD_INITIALIZED__ = true;
 
-  const VERSION = "1.0.2";
+  const VERSION = "1.0.3";
   const STORAGE_KEY = "miccord_settings_v1";
   const MSGLOG_KEY = "miccord_message_logs_v1";
   const SS_EVENTS_KEY = "miccord_screenshare_events_v1";
@@ -25,6 +25,37 @@
     warn: (...args) => console.warn("[Miccord]", ...args),
     error: (...args) => console.error("[Miccord]", ...args),
   };
+
+  // Micup's stores are MobX `makeAutoObservable(this, {}, { autoBind: true })` classes. With
+  // MobX's default `safeDescriptors: true` every store method becomes a read-only,
+  // non-configurable own property, so Patcher could never replace them (MessageLogger,
+  // ScreenShare, FakePlus... silently did nothing). MobX keeps its config in
+  // `globalThis.__mobxGlobals`; we run before Micup's modules, so we can turn that option off
+  // the moment MobX creates it, before any store exists. It only affects property descriptors.
+  (function relaxMobxDescriptors() {
+    try {
+      if (globalThis.__mobxGlobals) {
+        globalThis.__mobxGlobals.safeDescriptors = false; // injected late: only later stores
+        return;
+      }
+      let mobxGlobals;
+      Object.defineProperty(globalThis, "__mobxGlobals", {
+        configurable: true,
+        enumerable: false,
+        get() {
+          return mobxGlobals;
+        },
+        set(value) {
+          mobxGlobals = value;
+          try {
+            if (value && typeof value === "object") value.safeDescriptors = false;
+          } catch {}
+        },
+      });
+    } catch (e) {
+      console.warn("[Miccord] Não foi possível ajustar o MobX:", e);
+    }
+  })();
 
   // Screen-share diagnostics: why did the last streams stop? Read with `Miccord.screenShareEvents`.
   function recordScreenShareEvent(type, data = {}) {
@@ -500,12 +531,45 @@
     findByCode(...snippets) {
       if (!wreqRef?.m) return null;
       for (const [id, factory] of Object.entries(wreqRef.m)) {
-        const code = Function.prototype.toString.call(factory);
+        // Read the original factory: ours is wrapped, and its own source never matches.
+        const code = Function.prototype.toString.call(factory?.__orig || factory);
         if (snippets.every((s) => code.includes(s))) {
           return { id, exports: this.getModule(id), code };
         }
       }
       return null;
+    },
+    // Module ids move between Micup builds, export shapes rarely do. Returns the first loaded
+    // value (module exports, or any of its named exports) for which `test` returns true.
+    findExport(test) {
+      for (const mod of Object.values(wreqRef?.c || {})) {
+        const hit = matchExports(mod?.exports, test);
+        if (hit) return hit;
+      }
+      return null;
+    },
+    // Like findExport, but also waits for modules that load later. Calls `callback` once.
+    waitForExport(test, callback) {
+      const found = this.findExport(test);
+      if (found) {
+        try {
+          callback(found);
+        } catch (e) {
+          Logger.error("waitForExport callback:", e);
+        }
+        return;
+      }
+      const listener = (_id, exports) => {
+        const hit = matchExports(exports, test);
+        if (!hit) return;
+        anyModuleListeners.delete(listener);
+        try {
+          callback(hit);
+        } catch (e) {
+          Logger.error("waitForExport callback:", e);
+        }
+      };
+      anyModuleListeners.add(listener);
     },
     onModule(id, callback) {
       const strId = String(id);
@@ -522,6 +586,34 @@
       moduleListeners.get(strId).add(callback);
     },
   };
+
+  function matchExports(exports, test) {
+    if (!exports || (typeof exports !== "object" && typeof exports !== "function")) return null;
+    const passes = (value) => {
+      try {
+        return !!value && test(value);
+      } catch {
+        return false;
+      }
+    };
+    if (passes(exports)) return exports;
+    let keys;
+    try {
+      keys = Object.keys(exports);
+    } catch {
+      return null;
+    }
+    for (const key of keys) {
+      let value;
+      try {
+        value = exports[key]; // export getters can throw while a circular import is half-initialized
+      } catch {
+        continue;
+      }
+      if (passes(value)) return value;
+    }
+    return null;
+  }
 
   // Module ids are deterministic per source path, but they do change when Micup moves code
   // around (React was `13706` up to 1.0.17 and is gone in 1.0.21). Resolve by shape instead.
@@ -540,6 +632,36 @@
     const found = Webpack.find((exp) => isReactModule(exp));
     if (found) cachedReact = found;
     return cachedReact;
+  }
+
+  // Micup's CDN URL builders for stickers/emojis (`937185` up to 1.0.17, `512308` since 1.0.21).
+  // Found by their code; a miss is remembered for a minute so message sends don't rescan.
+  let cachedMediaHelpers = null;
+  let mediaHelpersMissAt = 0;
+  function getMediaUrlHelpers() {
+    if (cachedMediaHelpers) return cachedMediaHelpers;
+    if (Date.now() - mediaHelpersMissAt < 60000) return null;
+    const hit = Webpack.findByCode("stickers/${e}.webp", "emojis/${e}.webp");
+    const exports = hit ? hit.exports || Webpack.getModule(hit.id, true) : null;
+    const helpers = {};
+    for (const key of exports ? Object.keys(exports) : []) {
+      let fn;
+      try {
+        fn = exports[key];
+      } catch {
+        continue;
+      }
+      if (typeof fn !== "function") continue;
+      const src = Function.prototype.toString.call(fn.__miccordOrig || fn);
+      if (!helpers.stickerUrl && src.includes("stickers/${")) helpers.stickerUrl = fn;
+      if (!helpers.emojiUrl && src.includes("emojis/${")) helpers.emojiUrl = fn;
+    }
+    if (helpers.stickerUrl || helpers.emojiUrl) {
+      cachedMediaHelpers = helpers;
+    } else {
+      mediaHelpersMissAt = Date.now();
+    }
+    return cachedMediaHelpers;
   }
 
   function notifyModuleLoaded(id, exports, req) {
@@ -734,127 +856,138 @@
   const PLUGIN_DEFINITIONS = [
     {
       id: "ScreenShareBypass",
-      name: "ScreenShare Plus Bypass",
-      category: "Voz & Áudio",
+      name: "ScreenShare Plus",
+      category: "Voz e vídeo",
       author: "Better MicUP",
-      description:
-        "Desbloqueia compartilhamento de tela em 1080p (Full HD), 1440p (Quad HD) e Source/4K Nativo a 60, 90 ou 120 FPS com bitrate de até 20 Mbps sem precisar de assinatura Plus.",
+      description: "Libera as resoluções e taxas de quadros do Plus no compartilhamento de tela e aumenta o bitrate.",
       settingsSchema: [
         {
           key: "maxBitrateKbps",
-          label: "Bitrate Máximo de Vídeo",
+          label: "Bitrate máximo",
           type: "select",
           options: [
-            { value: "6000", label: "6.000 kbps (6 Mbps — Padrão Plus)" },
-            { value: "9000", label: "9.000 kbps (9 Mbps — Alta Nitidez)" },
-            { value: "12000", label: "12.000 kbps (12 Mbps — Ultra HD)" },
-            { value: "15000", label: "15.000 kbps (15 Mbps — 4K Extremo)" },
-            { value: "20000", label: "20.000 kbps (20 Mbps — Sem Compressão)" },
+            { value: "6000", label: "6 Mbps", description: "Igual ao Plus." },
+            { value: "9000", label: "9 Mbps" },
+            { value: "12000", label: "12 Mbps", description: "Recomendado." },
+            { value: "15000", label: "15 Mbps" },
+            { value: "20000", label: "20 Mbps", description: "Só para internet boa de upload." },
           ],
         },
+        {
+          key: "disableEncoderThrottling",
+          label: "Manter resolução e FPS fixos",
+          description: "Desliga a adaptação automática do Micup. Mais nitidez, mas o stream pode engasgar em internet ou PC mais fracos.",
+          type: "boolean",
+        },
       ],
-    },
-    {
-      id: "MessageLogger",
-      name: "MessageLogger",
-      category: "Chat & Privacidade",
-      author: "Better MicUP",
-      description:
-        "Salva mensagens apagadas e histórico de edições em tempo real. Mantém mensagens excluídas visíveis diretamente no chat com selo [APAGADA].",
-      settingsSchema: [
-        { key: "keepDeletedInChat", label: "Manter mensagens apagadas visíveis no chat", type: "boolean" },
-        { key: "showInlineEdits", label: "Anexar texto antigo ao editar mensagem", type: "boolean" },
-        { key: "ignoreBots", label: "Ignorar mensagens de Bots", type: "boolean" },
-        { key: "ignoreSelf", label: "Ignorar minhas próprias mensagens", type: "boolean" },
-      ],
-    },
-    {
-      id: "NoTrack",
-      name: "NoTrack & Anti-Telemetry",
-      category: "Sistema & Segurança",
-      author: "Better MicUP",
-      description:
-        "Bloqueia requisições de telemetria, analytics, relatórios automáticos e rastreamento em segundo plano.",
-      settingsSchema: [],
-    },
-    {
-      id: "CallTimer",
-      name: "CallTimer",
-      category: "Voz & Áudio",
-      author: "Better MicUP",
-      description:
-        "Exibe um cronômetro em tempo real (HH:MM:SS) mostrando há quanto tempo você está conectado no canal de voz atual.",
-      settingsSchema: [],
-    },
-    {
-      id: "ExperimentsAndHiddenTabs",
-      name: "Experiments & Developer Options",
-      category: "Sistema & Segurança",
-      author: "Better MicUP",
-      description:
-        "Habilita o Modo Desenvolvedor e desbloqueia a aba oculta 'Developer Options' nativa do Micup nas Configurações de Usuário.",
-      settingsSchema: [],
-    },
-    {
-      id: "AlwaysTrustDomains",
-      name: "AlwaysTrustDomains & CleanURLs",
-      category: "Chat & Privacidade",
-      author: "Better MicUP",
-      description:
-        "Desativa o modal de confirmação ao clicar em links externos e limpa parâmetros de rastreamento (utm_*, fbclid, gclid) automaticamente.",
-      settingsSchema: [
-        { key: "cleanTrackingParams", label: "Sanitizar URLs (remover utm_*, fbclid)", type: "boolean" },
-      ],
-    },
-    {
-      id: "DevToolsShortcut",
-      name: "DevTools & Hotkeys (F12 / Ctrl+Shift+M)",
-      category: "Sistema & Segurança",
-      author: "Better MicUP",
-      description:
-        "Ativa F12 e Ctrl+Shift+I para abrir o Chromium DevTools nativo do Electron e Ctrl+Shift+M para abrir o painel rápido do Better MicUP.",
-      settingsSchema: [],
     },
     {
       id: "VolumeBooster",
-      name: "Volume Individual Amplificado",
-      category: "Voz & Áudio",
+      name: "Volume Booster",
+      category: "Voz e vídeo",
       author: "Better MicUP",
-      description:
-        "Permite aumentar o volume de amigos e participantes da chamada além do limite padrão do app (até 200%) com ganho WebAudio sem distorção.",
+      description: "Deixa aumentar o volume de cada pessoa na chamada acima de 100%.",
       settingsSchema: [
         {
           key: "maxMultiplier",
-          label: "Limite Máximo de Volume",
+          label: "Volume máximo",
           type: "select",
           options: [
-            { value: "200", label: "200% (2x — Dobro de Volume Recomendado)" },
-            { value: "250", label: "250% (2.5x — Alto Ganho)" },
-            { value: "300", label: "300% (3x — Ganho Extremo)" },
+            { value: "200", label: "200%" },
+            { value: "250", label: "250%" },
+            { value: "300", label: "300%", description: "Pode distorcer o áudio." },
           ],
         },
+      ],
+    },
+    {
+      id: "CallTimer",
+      name: "Call Timer",
+      category: "Voz e vídeo",
+      author: "Better MicUP",
+      description: "Mostra há quanto tempo você está na chamada, ao lado do nome do canal no painel de voz.",
+      settingsSchema: [],
+    },
+    {
+      id: "MessageLogger",
+      name: "Message Logger",
+      category: "Mensagens",
+      author: "Better MicUP",
+      description: "Guarda mensagens apagadas e o texto anterior de mensagens editadas. O histórico fica na aba Message Logger.",
+      settingsSchema: [
+        { key: "keepDeletedInChat", label: "Manter mensagens apagadas visíveis no chat", type: "boolean" },
+        { key: "showInlineEdits", label: "Mostrar o texto antigo de mensagens editadas", type: "boolean" },
+        { key: "ignoreBots", label: "Ignorar bots", type: "boolean" },
+        { key: "ignoreSelf", label: "Ignorar minhas mensagens", type: "boolean" },
       ],
     },
     {
       id: "FakePlus",
-      name: "Fake Plus (Emotes & Stickers Livres)",
-      category: "Chat & Mensagens",
+      name: "Fake Plus",
+      category: "Mensagens",
       author: "Better MicUP",
-      description:
-        "Desbloqueia o envio de emojis customizados e stickers de qualquer servidor ou DM sem necessidade de assinatura Plus. Converte para imagens em alta resolução ao enviar.",
+      description: "Deixa usar emojis e stickers de qualquer servidor. Para quem não tem Plus, eles são enviados como imagem.",
       settingsSchema: [
         {
           key: "convertExternalToLinks",
-          label: "Converter emotes externos para links CDN de alta resolução (NitroSpoof)",
+          label: "Enviar emojis de outros servidores como imagem",
           type: "boolean",
         },
       ],
+    },
+    {
+      id: "NoTrack",
+      name: "NoTrack",
+      category: "Privacidade",
+      author: "Better MicUP",
+      description: "Bloqueia telemetria, analytics e relatórios automáticos do Micup.",
+      settingsSchema: [],
+    },
+    {
+      id: "AlwaysTrustDomains",
+      name: "Links Confiáveis",
+      category: "Privacidade",
+      author: "Better MicUP",
+      description: "Abre links externos sem o aviso de confirmação. Sua lista de sites confiáveis não é alterada.",
+      settingsSchema: [
+        {
+          key: "cleanTrackingParams",
+          label: "Remover rastreadores dos links",
+          description: "Tira parâmetros como utm_* e fbclid (usa a opção do próprio Micup).",
+          type: "boolean",
+        },
+      ],
+    },
+    {
+      id: "ExperimentsAndHiddenTabs",
+      name: "Experiments",
+      category: "Sistema",
+      author: "Better MicUP",
+      description: "Liga o modo desenvolvedor do Micup, que mostra a categoria Developer nas configurações.",
+      settingsSchema: [],
+    },
+    {
+      id: "DevToolsShortcut",
+      name: "Atalhos",
+      category: "Sistema",
+      author: "Better MicUP",
+      description: "F12 ou Ctrl+Shift+I abrem o DevTools; Ctrl+Shift+M abre estas configurações.",
+      settingsSchema: [],
     },
   ];
 
   // Sync runtime plugin settings with Micup's internal stores
   function syncStoreBasedPlugins() {
-    try {
+    // Each step is independent: a store that isn't there (or throws) must not stop the rest.
+    const step = (name, fn) => {
+      try {
+        fn();
+      } catch (err) {
+        Logger.warn(`Aviso ao sincronizar (${name}):`, err);
+      }
+    };
+
+    step("user-traits", () => {
       // 1. ScreenShareBypass & FakePlus traits via UserStore (978111)
       const userStoreMod = Webpack.getModule(978111);
       const userStore = userStoreMod?.A || userStoreMod?.default;
@@ -884,7 +1017,9 @@
           "ScreenShareBypass_UserTraits"
         );
       }
+    });
 
+    step("camera-1080p", () => {
       // 2. Camera 1080p unlock via VoiceSettings
       const ssCfg = state.settings.plugins.ScreenShareBypass;
       if (ssCfg?.enabled) {
@@ -904,24 +1039,45 @@
           } catch {}
         }
       }
+    });
 
-      // 3. ExperimentsAndHiddenTabs + AlwaysTrustDomains + NoTrack + FakePlus DeveloperOptions
-      const userSettingsMod = Webpack.getModule(407149);
-      const userSettings = userSettingsMod?.default || userSettingsMod?.A;
-      if (userSettings) {
-        if (state.settings.plugins.ExperimentsAndHiddenTabs?.enabled && typeof userSettings.setDeveloperMode === "function") {
-          if (!userSettings.developerMode) userSettings.setDeveloperMode(true);
-        }
-        if (state.settings.plugins.AlwaysTrustDomains?.enabled && typeof userSettings.setSanitizeUrls === "function") {
-          userSettings.setSanitizeUrls( Boolean(state.settings.plugins.AlwaysTrustDomains.cleanTrackingParams) );
+    step("developer-mode", () => {
+      // 3. ExperimentsAndHiddenTabs: Micup's DeveloperMode store unlocks the "Developer"
+      //    settings category after 7 taps on the build number. Do the same taps.
+      if (state.settings.plugins.ExperimentsAndHiddenTabs?.enabled) {
+        const devMode = Webpack.findExport(
+          (o) => typeof o === "object" && typeof o.registerBuildTap === "function" && "manuallyEnabled" in o
+        );
+        // isDeveloper also checks the current user (staff); fall back to the manual flag.
+        const isDev = () => {
+          try {
+            return devMode.isDeveloper;
+          } catch {
+            return devMode.manuallyEnabled === true;
+          }
+        };
+        if (devMode && !isDev()) {
+          for (let i = 0; i < 7 && !isDev(); i++) devMode.registerBuildTap();
         }
       }
+    });
 
-      const trustActMod = Webpack.getModule(422204);
-      if (trustActMod && typeof trustActMod.ni === "function") {
-        trustActMod.ni(Boolean(state.settings.plugins.AlwaysTrustDomains?.enabled));
+    step("clean-urls", () => {
+      // 4. AlwaysTrustDomains › clean tracking params: Micup's own "sanitize URLs" preference.
+      //    Only write when it differs: every write is synced to Micup's servers.
+      if (state.settings.plugins.AlwaysTrustDomains?.enabled) {
+        const userSettings = Webpack.findExport(
+          (o) => typeof o === "object" && typeof o.setSanitizeUrls === "function" && typeof o.getSanitizeUrls === "function"
+        );
+        const wanted = Boolean(state.settings.plugins.AlwaysTrustDomains.cleanTrackingParams);
+        if (userSettings && userSettings.getSanitizeUrls() !== wanted) userSettings.setSanitizeUrls(wanted);
       }
+      // (Trusting every domain is a patch on isTrustedDomain in setupCoreHooks. The old code
+      //  called setTrustAllDomains(false) whenever the plugin was off, which wiped the user's
+      //  saved trusted-domain list on every sync.)
+    });
 
+    step("dev-options", () => {
       const devStoreMod = Webpack.getModule(525564);
       const devStore = devStoreMod?.A || devStoreMod?.default;
       if (devStore && typeof devStore.setOption === "function") {
@@ -936,16 +1092,16 @@
           } catch {}
         }
       }
+    });
 
+    step("volume-ctx", () => {
       // 4. VolumeBooster AudioContext check
       if (state.settings.plugins.VolumeBooster?.enabled && window.__miccordSharedAudioCtx) {
         if (window.__miccordSharedAudioCtx.state === "suspended") {
           window.__miccordSharedAudioCtx.resume().catch(() => {});
         }
       }
-    } catch (err) {
-      console.warn("[Miccord] Aviso ao sincronizar stores:", err);
-    }
+    });
   }
 
   // ==========================================================================
@@ -962,9 +1118,9 @@
       const MICCORD_TABS = [
         { type: "miccord_dashboard", category: "miccord", label: "Better MicUP" },
         { type: "miccord_plugins", category: "miccord", label: "Plugins" },
-        { type: "miccord_themes", category: "miccord", label: "Temas & QuickCSS" },
+        { type: "miccord_themes", category: "miccord", label: "Temas" },
         { type: "miccord_msglogger", category: "miccord", label: "Message Logger" },
-        { type: "miccord_devtools", category: "miccord", label: "DevTools & Rspack" },
+        { type: "miccord_devtools", category: "miccord", label: "Desenvolvedor" },
       ];
 
       function makeMiccordIcon(pathD) {
@@ -1073,17 +1229,37 @@
 
       // 5. Since Micup 1.0.21 the settings modal resolves a tab's component with plain object
       //    lookups that are not exported (`Mb[type] ?? Mf[type]` inside the UserSettingsModal
-      //    module). A non-enumerable property on Object.prototype makes those lookups find our
-      //    tabs without rewriting Micup's code. The `miccord_` prefix keeps it collision-free;
-      //    being a writable data property, plain assignments to these keys still work.
+      //    module). A non-enumerable getter on Object.prototype makes those lookups find our
+      //    tabs without rewriting Micup's code.
+      //    It must answer ONLY for those component maps: Micup keeps other per-tab maps
+      //    (`unsavedChanges[tab]`, `tabData[tab]`, `flashTriggers[tab]`), and a plain value here
+      //    made it think our tabs had unsaved changes, which locked the settings modal.
+      // Values are React components: plain functions, or objects like memo()/forwardRef()
+      // (Micup wraps its tabs in MobX `observer`, which returns a memo object).
+      const isComponent = (v) =>
+        typeof v === "function" || (!!v && typeof v === "object" && typeof v.$$typeof === "symbol");
+      const isTabComponentMap = (obj) => {
+        try {
+          const a = Object.getOwnPropertyDescriptor(obj, "my_profile");
+          const b = Object.getOwnPropertyDescriptor(obj, "account_security");
+          return !!a && !!b && "value" in a && "value" in b && isComponent(a.value) && isComponent(b.value);
+        } catch {
+          return false;
+        }
+      };
       for (const t of MICCORD_TABS) {
         if (Object.prototype.hasOwnProperty.call(Object.prototype, t.type)) continue;
         try {
           Object.defineProperty(Object.prototype, t.type, {
-            value: getMiccordTabComponent(t.type),
-            writable: true,
             configurable: true,
             enumerable: false,
+            get() {
+              return isTabComponentMap(this) ? getMiccordTabComponent(t.type) : undefined;
+            },
+            // Assignments keep working like on any plain object (own data property).
+            set(value) {
+              Object.defineProperty(this, t.type, { value, writable: true, configurable: true, enumerable: true });
+            },
           });
         } catch (e) {
           Logger.warn("Não foi possível registrar a aba", t.type, e);
@@ -1296,53 +1472,30 @@
     });
 
     // ------------------------------------------------------------------------
-    // C. Hook Gateway (`582520`) for CallTimer
+    // C. CallTimer: the gateway socket class builds every VOICE_STATE_UPDATE we send (join,
+    //    mute, move, leave). Patching its prototype catches all of them, whatever module or
+    //    socket instance it lives in (the `582520` gateway facade is gone since 1.0.21).
+    //    The timer is drawn in the voice panel by renderCallTimer().
     // ------------------------------------------------------------------------
-    Webpack.onModule(582520, (exports) => {
-      const gw = exports?.default || exports?.A;
-      if (!gw || gw.__miccordPatched) return;
-      gw.__miccordPatched = true;
-
-      function hookSocketInstance(socket) {
-        if (!socket || socket.__miccordSocketPatched) return;
-        socket.__miccordSocketPatched = true;
-
-        // Patch buildVoiceStatePayload for CallTimer
-        if (typeof socket.buildVoiceStatePayload === "function") {
-          Patcher.after(
-            socket,
-            "buildVoiceStatePayload",
-            (_args, payload) => {
-              if (!payload || typeof payload !== "object") return payload;
-
-              // Track CallTimer start/stop
-              if (payload.channel_id) {
-                if (state.currentVoiceChannelId !== payload.channel_id) {
-                  state.currentVoiceChannelId = payload.channel_id;
-                  state.callStartTime = Date.now();
-                }
-              } else {
-                state.currentVoiceChannelId = null;
-                state.callStartTime = null;
-              }
-              notifyUI();
-              return payload;
-            },
-            "CallTimerPayload"
-          );
-        }
+    Webpack.waitForExport(
+      (v) => typeof v === "function" && typeof v.prototype?.buildVoiceStatePayload === "function",
+      (SocketClass) => {
+        if (SocketClass.prototype.__miccordCallTimer) return;
+        SocketClass.prototype.__miccordCallTimer = true;
+        Patcher.after(
+          SocketClass.prototype,
+          "buildVoiceStatePayload",
+          (args, payload) => {
+            const update = args[0] && typeof args[0] === "object" ? args[0] : payload?.d || payload;
+            if (update && typeof update === "object" && "channel_id" in update) {
+              onVoiceChannelChange(update.channel_id || null);
+            }
+            return payload;
+          },
+          "CallTimerPayload"
+        );
       }
-
-      if (gw.socket) hookSocketInstance(gw.socket);
-      Patcher.after(
-        gw,
-        "initialize",
-        () => {
-          if (gw.socket) hookSocketInstance(gw.socket);
-        },
-        "GatewayInitSocket"
-      );
-    });
+    );
 
     // ------------------------------------------------------------------------
     // D. Hook TypingActions (`377988`) & HTTPClient (`370375`) for SilentTyping & NoTrack
@@ -1388,7 +1541,7 @@
           // FakePlus message interceptor (Stickers & External Emotes)
           if (state.settings.plugins.FakePlus?.enabled && url.includes("/messages") && !url.includes("/search")) {
             try {
-              const mediaHelper = Webpack.getModule(937185);
+              const mediaHelper = getMediaUrlHelpers();
               const configStore = Webpack.getModule(799377);
               const mediaEndpoint = configStore?.default?.mediaEndpoint || "https://media.micup.gg";
 
@@ -1400,8 +1553,8 @@
                   const stickerId = payload.sticker_ids[0];
                   let stickerUrl = null;
                   try {
-                    if (typeof mediaHelper?.bm === "function") {
-                      stickerUrl = mediaHelper.bm({ id: stickerId, size: 160 });
+                    if (typeof mediaHelper?.stickerUrl === "function") {
+                      stickerUrl = mediaHelper.stickerUrl({ id: stickerId, size: 160 });
                     }
                   } catch {}
                   if (!stickerUrl) {
@@ -1418,8 +1571,8 @@
                   payload.content = payload.content.replace(/<(a?):([a-zA-Z0-9_~]+):([0-9]+)>/g, (_match, animated, _name, id) => {
                     let emojiUrl = null;
                     try {
-                      if (typeof mediaHelper?._O === "function") {
-                        emojiUrl = mediaHelper._O({ id, animated: Boolean(animated) });
+                      if (typeof mediaHelper?.emojiUrl === "function") {
+                        emojiUrl = mediaHelper.emojiUrl({ id, animated: Boolean(animated) });
                       }
                     } catch {}
                     if (!emojiUrl) {
@@ -1451,10 +1604,11 @@
     });
 
     // Sync store-based plugins once key stores load
-    for (const storeId of [525564, 407149, 422204, 823063, 978111, 844865, 685161, 618349, 496416, 468258]) {
+    for (const storeId of [525564, 823063, 978111, 844865, 685161, 618349, 468258]) {
       Webpack.onModule(storeId, () => syncStoreBasedPlugins());
     }
     setTimeout(syncStoreBasedPlugins, 1800);
+    setTimeout(syncStoreBasedPlugins, 8000); // stores found by shape may finish loading later
 
     // ------------------------------------------------------------------------
     // E. ScreenSharePlusBypass Hooks (`690261`, `477986`, `702223`, `857720`, `414298`)
@@ -2510,6 +2664,29 @@
     });
 
     // ------------------------------------------------------------------------
+    // E2. AlwaysTrustDomains: answer "trusted" to Micup's link check while the plugin is on, so
+    //     external links open without the warning. Nothing is saved: turning the plugin off
+    //     brings the normal check back and the user's own trusted-domain list is never touched.
+    //     (Needs relaxMobxDescriptors(): this store is a MobX autoBind store.)
+    // ------------------------------------------------------------------------
+    Webpack.waitForExport(
+      (o) =>
+        typeof o === "object" &&
+        typeof o.isTrustedDomain === "function" &&
+        typeof o.setTrustAllDomains === "function",
+      (trustStore) => {
+        if (trustStore.__miccordPatched) return;
+        trustStore.__miccordPatched = true;
+        Patcher.instead(
+          trustStore,
+          "isTrustedDomain",
+          (args, orig) => (state.settings.plugins.AlwaysTrustDomains?.enabled ? true : orig(...args)),
+          "AlwaysTrustDomains"
+        );
+      }
+    );
+
+    // ------------------------------------------------------------------------
     // F. FakePlus Expression Picker & Permission Hooks (`618349`)
     // ------------------------------------------------------------------------
     Webpack.onModule(618349, (exports) => {
@@ -2699,10 +2876,17 @@
       );
     });
 
-    // 3. Module 496416: LiveKit RemoteAudioTrack (EQ) WebAudio Gain & Amplification
-    Webpack.onModule(496416, (exports) => {
-      const RemoteAudioTrack = exports?.EQ;
-      if (!RemoteAudioTrack || !RemoteAudioTrack.prototype || RemoteAudioTrack.prototype.__miccordPatched) return;
+    // 3. LiveKit RemoteAudioTrack: WebAudio gain so volumes above 100% actually get louder.
+    //    (LiveKit was module `496416` exported as `EQ` up to 1.0.17, `234484` since 1.0.21;
+    //    found by shape: only RemoteAudioTrack has setVolume + connectWebAudio.)
+    Webpack.waitForExport(
+      (v) =>
+        typeof v === "function" &&
+        typeof v.prototype?.setVolume === "function" &&
+        typeof v.prototype?.setAudioContext === "function" &&
+        typeof v.prototype?.connectWebAudio === "function",
+      (RemoteAudioTrack) => {
+      if (RemoteAudioTrack.prototype.__miccordPatched) return;
       RemoteAudioTrack.prototype.__miccordPatched = true;
 
       const origSetVolume = RemoteAudioTrack.prototype.setVolume;
@@ -2728,7 +2912,8 @@
         }
         return origSetVolume.call(this, vol);
       };
-    });
+      }
+    );
   }
 
   // ==========================================================================
@@ -2744,932 +2929,855 @@
     return miccordTabComponents.get(tabType);
   }
 
-  function createMiccordSettingsComponent(initialTabType = "miccord_dashboard") {
-    return function MiccordSettingsView(props) {
-      const React = getReact();
-      if (!React) return null;
+  // --------------------------------------------------------------------------
+  // UI building blocks. Switch and Button are Micup's own components (found by code,
+  // so they survive Micup updates), with look-alike fallbacks if they can't be found.
+  // --------------------------------------------------------------------------
+  const h = (...args) => getReact().createElement(...args);
+  const REPO_URL = "https://github.com/httpsphl/better-micup";
 
-      const h = React.createElement;
-      const [activeSubTab, setActiveSubTab] = React.useState(props?.settingsTabType || initialTabType);
-      const [, forceRender] = React.useReducer((x) => x + 1, 0);
-      const [searchQuery, setSearchQuery] = React.useState("");
-      const [catFilter, setCatFilter] = React.useState("ALL");
-      const [rspackQuery, setRspackQuery] = React.useState("");
-      const [evalInput, setEvalInput] = React.useState("Miccord.Webpack.getModule(978111)?.A?.getCurrentUser()");
-      const [evalOutput, setEvalOutput] = React.useState("");
-
-      React.useEffect(() => {
-        if (props?.settingsTabType && props.settingsTabType.startsWith("miccord_")) {
-          setActiveSubTab(props.settingsTabType);
+  let nativeUI = null;
+  function getNativeUI() {
+    if (nativeUI) return nativeUI;
+    const pick = (snippet) => {
+      try {
+        const hit = Webpack.findByCode(snippet);
+        const exports = hit && (hit.exports || Webpack.getModule(hit.id, true));
+        if (!exports) return null;
+        for (const key of Object.keys(exports)) {
+          const value = exports[key];
+          if (typeof value === "function" || (value && typeof value === "object" && value.$$typeof)) return value;
         }
-      }, [props?.settingsTabType]);
+      } catch {}
+      return null;
+    };
+    nativeUI = {
+      Switch: pick('"ui.form.switch.container"'),
+      Button: pick('"ui.button.button.focus-ring"'),
+    };
+    return nativeUI;
+  }
 
-      React.useEffect(() => {
-        state.uiListeners.add(forceRender);
-        return () => state.uiListeners.delete(forceRender);
-      }, []);
+  // Re-render when settings/logs change (saveSettings and saveMessageLogs call notifyUI).
+  function useMiccordState() {
+    const React = getReact();
+    const [, force] = React.useReducer((x) => x + 1, 0);
+    React.useEffect(() => {
+      state.uiListeners.add(force);
+      return () => state.uiListeners.delete(force);
+    }, []);
+  }
 
-      const enabledCount = Object.values(state.settings.plugins).filter((p) => p?.enabled).length;
-      const totalModules = Object.keys(Webpack.factories || {}).length;
-      const loadedModules = Object.keys(Webpack.cache || {}).length;
+  function Switch({ label, description, value, onChange, disabled }) {
+    const Native = getNativeUI().Switch;
+    if (Native) return h(Native, { label, description, value: !!value, onChange, disabled });
+    return h(
+      "div",
+      { className: "bmu-switch-row" },
+      h(
+        "div",
+        { className: "bmu-switch-text" },
+        h("span", { className: "bmu-switch-label" }, label),
+        description && h("span", { className: "bmu-switch-desc" }, description)
+      ),
+      h(
+        "button",
+        {
+          type: "button",
+          role: "switch",
+          "aria-checked": !!value,
+          "aria-label": typeof label === "string" ? label : undefined,
+          className: "bmu-switch" + (value ? " is-on" : ""),
+          disabled,
+          onClick: () => onChange(!value),
+        },
+        h("span", { className: "bmu-switch-thumb" })
+      )
+    );
+  }
 
-      // Helper to toggle a plugin
-      const onTogglePlugin = (pluginId) => {
-        const cur = state.settings.plugins[pluginId] || {};
-        cur.enabled = !cur.enabled;
-        state.settings.plugins[pluginId] = cur;
-        saveSettings();
-        syncStoreBasedPlugins();
-        showToast(
-          `Plugin ${pluginId}: ${cur.enabled ? "Ativado" : "Desativado"}`,
-          cur.enabled ? "success" : "info"
-        );
-      };
+  function Button({ variant = "secondary", small = true, onClick, disabled, children }) {
+    const Native = getNativeUI().Button;
+    if (Native) return h(Native, { variant, small, onClick, disabled }, children);
+    return h(
+      "button",
+      { type: "button", className: `bmu-btn is-${variant}${small ? " is-small" : ""}`, onClick, disabled },
+      children
+    );
+  }
 
-      // Helper to update a plugin sub-setting
-      const onUpdatePluginSetting = (pluginId, key, val) => {
-        if (!state.settings.plugins[pluginId]) state.settings.plugins[pluginId] = { enabled: true };
-        state.settings.plugins[pluginId][key] = val;
-        saveSettings();
-        syncStoreBasedPlugins();
-      };
+  // A destructive button that asks for a second click instead of a blocking confirm().
+  function ConfirmButton({ children, confirmLabel = "Clique de novo para confirmar", onConfirm }) {
+    const React = getReact();
+    const [armed, setArmed] = React.useState(false);
+    React.useEffect(() => {
+      if (!armed) return undefined;
+      const t = setTimeout(() => setArmed(false), 4000);
+      return () => clearTimeout(t);
+    }, [armed]);
+    return h(
+      Button,
+      {
+        variant: "danger",
+        onClick: () => {
+          if (armed) {
+            setArmed(false);
+            onConfirm();
+          } else {
+            setArmed(true);
+          }
+        },
+      },
+      armed ? confirmLabel : children
+    );
+  }
 
-      // Sub-navigation Header
-      const renderHeroAndSubnav = () =>
+  function Section({ title, description, actions, children }) {
+    return h(
+      "section",
+      { className: "bmu-section" },
+      (title || actions) &&
         h(
-          React.Fragment,
+          "div",
+          { className: "bmu-section-head" },
+          title && h("h2", { className: "bmu-section-title" }, title),
+          actions && h("div", { className: "bmu-actions" }, actions)
+        ),
+      description && h("p", { className: "bmu-section-desc" }, description),
+      children
+    );
+  }
+
+  const Subtitle = ({ children }) => h("h3", { className: "bmu-subtitle" }, children);
+  const Divider = () => h("hr", { className: "bmu-divider" });
+  const Note = ({ children }) => h("p", { className: "bmu-note" }, children);
+  const Actions = ({ children }) => h("div", { className: "bmu-actions" }, children);
+
+  function RadioList({ value, options, onChange }) {
+    return h(
+      "div",
+      { className: "bmu-radio-list", role: "radiogroup" },
+      options.map((option) => {
+        const checked = String(value) === String(option.value);
+        return h(
+          "label",
+          { key: option.value, className: "bmu-radio" + (checked ? " is-checked" : "") },
+          h("input", { type: "radio", checked, onChange: () => onChange(option.value) }),
+          h("span", { className: "bmu-radio-dot", "aria-hidden": "true" }),
+          h(
+            "span",
+            { className: "bmu-radio-text" },
+            h("span", { className: "bmu-radio-label" }, option.label),
+            option.description && h("span", { className: "bmu-radio-desc" }, option.description)
+          )
+        );
+      })
+    );
+  }
+
+  function Segmented({ value, options, onChange }) {
+    return h(
+      "div",
+      { className: "bmu-segmented", role: "tablist" },
+      options.map((option) =>
+        h(
+          "button",
+          {
+            key: option.value,
+            type: "button",
+            role: "tab",
+            "aria-selected": value === option.value,
+            className: "bmu-segment" + (value === option.value ? " is-active" : ""),
+            onClick: () => onChange(option.value),
+          },
+          option.label
+        )
+      )
+    );
+  }
+
+  function TextInput({ value, onChange, placeholder, className = "" }) {
+    return h("input", {
+      className: "bmu-input " + className,
+      value: value ?? "",
+      placeholder,
+      spellCheck: false,
+      onChange: (e) => onChange(e.target.value),
+    });
+  }
+
+  function ErrorBoundaryFor(Page) {
+    const React = getReact();
+    if (!ErrorBoundaryFor.cls) {
+      ErrorBoundaryFor.cls = class MiccordErrorBoundary extends React.Component {
+        constructor(props) {
+          super(props);
+          this.state = { error: null };
+        }
+        static getDerivedStateFromError(error) {
+          return { error };
+        }
+        componentDidCatch(error) {
+          Logger.error("Erro numa tela do Better MicUP:", error);
+        }
+        render() {
+          if (!this.state.error) return this.props.children;
+          return h(
+            "div",
+            { className: "bmu-error" },
+            h("strong", null, "Esta tela do Better MicUP deu erro."),
+            h("code", null, String(this.state.error?.message || this.state.error)),
+            h(Button, { onClick: () => this.setState({ error: null }) }, "Tentar de novo")
+          );
+        }
+      };
+    }
+    return h(ErrorBoundaryFor.cls, null, h(Page));
+  }
+
+  // --------------------------------------------------------------------------
+  // Settings actions
+  // --------------------------------------------------------------------------
+  function setPluginEnabled(id, enabled) {
+    state.settings.plugins[id] = { ...(state.settings.plugins[id] || {}), enabled };
+    saveSettings();
+    syncStoreBasedPlugins();
+  }
+
+  function setPluginOption(id, key, value) {
+    state.settings.plugins[id] = { ...(state.settings.plugins[id] || { enabled: true }), [key]: value };
+    saveSettings();
+    syncStoreBasedPlugins();
+  }
+
+  function activeThemeName() {
+    const id = state.settings.activeTheme || "obsidian";
+    if (id === "none") return "Original do Micup";
+    return PRESET_THEMES.find((t) => t.id === id)?.name || "Black Obsidian";
+  }
+
+  // --------------------------------------------------------------------------
+  // Page: Better MicUP (overview, updates, backup)
+  // --------------------------------------------------------------------------
+  function GeneralPage() {
+    const React = getReact();
+    useMiccordState();
+    const [importing, setImporting] = React.useState(false);
+    const [importText, setImportText] = React.useState("");
+    const enabled = PLUGIN_DEFINITIONS.filter((p) => state.settings.plugins[p.id]?.enabled).length;
+
+    const applyImport = () => {
+      try {
+        const parsed = JSON.parse(importText);
+        if (!parsed || typeof parsed !== "object" || !parsed.plugins) throw new Error("não parece um backup do Better MicUP");
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+        state.settings = loadSettings();
+        saveSettings();
+        syncStoreBasedPlugins();
+        setImporting(false);
+        setImportText("");
+        showToast("Configurações importadas.", "success");
+      } catch (e) {
+        showToast(`Não deu para importar: ${e.message}`, "error");
+      }
+    };
+
+    return h(
+      React.Fragment,
+      null,
+      h(
+        "div",
+        { className: "bmu-hero" },
+        h("div", { className: "bmu-hero-icon" }, svgIconReact("zap", 20)),
+        h(
+          "div",
+          { className: "bmu-hero-text" },
+          h("div", { className: "bmu-hero-title" }, "Better MicUP", h("span", { className: "bmu-chip" }, `v${VERSION}`)),
+          h(
+            "div",
+            { className: "bmu-hero-sub" },
+            `${enabled} de ${PLUGIN_DEFINITIONS.length} plugins ligados · tema ${activeThemeName()}`
+          )
+        )
+      ),
+      h(
+        Section,
+        {
+          title: "Atualizações",
+          description:
+            "O Better MicUP se atualiza sozinho: a cada 3 horas ele procura uma versão nova e só instala versões assinadas pelo autor. A versão nova vale na próxima vez que o Micup abrir.",
+        },
+        h(
+          Actions,
+          null,
+          h("a", { className: "bmu-link-btn", href: `${REPO_URL}/releases`, target: "_blank", rel: "noreferrer" }, "Ver novidades"),
+          h(Button, { onClick: () => location.reload() }, "Recarregar o Micup")
+        )
+      ),
+      h(Divider),
+      h(
+        Section,
+        {
+          title: "Backup",
+          description: "Plugins, opções, tema e QuickCSS ficam salvos neste computador. Copie para guardar ou levar para outro PC.",
+        },
+        h(
+          Actions,
           null,
           h(
-            "div",
-            { className: "miccord-hero" },
-            h(
-              "div",
-              { className: "miccord-hero-left" },
-              h(
-                "h2",
-                { className: "miccord-hero-title" },
-                svgIconReact("zap", 18, { strokeWidth: 2.2 }),
-                "Better MicUP",
-                h("span", { style: { fontSize: "12px", color: "var(--miccord-text-muted)", fontWeight: "500", marginLeft: "6px" } }, "Client Mod & Motor de Plugins"),
-                h("span", { className: "miccord-badge-pill" }, `v${VERSION}`)
-              ),
-              h(
-                "p",
-                { className: "miccord-hero-sub" },
-                "Fica em Configurações do Micup › Better MicUP (atalho opcional: Ctrl+Shift+M)."
-              )
-            ),
-            h(
-              "div",
-              { style: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" } },
-              h(
-                "button",
-                {
-                  className: "miccord-btn",
-                  onClick: () => window.flx?.devtools?.open?.(),
-                },
-                svgIconReact("terminal", 13),
-                "DevTools (F12)"
-              ),
-              h(
-                "button",
-                {
-                  className: "miccord-btn primary",
-                  onClick: () => location.reload(),
-                },
-                svgIconReact("refresh", 13),
-                "Recarregar UI"
-              )
-            )
+            Button,
+            {
+              onClick: () => {
+                navigator.clipboard?.writeText(JSON.stringify(state.settings, null, 2));
+                showToast("Configurações copiadas.", "success");
+              },
+            },
+            "Copiar configurações"
           ),
+          h(Button, { onClick: () => setImporting(!importing) }, importing ? "Cancelar importação" : "Importar"),
           h(
-            "div",
-            { className: "miccord-subnav" },
-            [
-              { id: "miccord_dashboard", label: "Visão Geral", icon: "grid" },
-              { id: "miccord_plugins", label: `Plugins (${enabledCount}/${PLUGIN_DEFINITIONS.length})`, icon: "package" },
-              { id: "miccord_themes", label: "Temas & QuickCSS", icon: "palette" },
-              { id: "miccord_msglogger", label: `Message Logger (${state.messageLogs.length})`, icon: "history" },
-              { id: "miccord_devtools", label: "DevTools & Rspack", icon: "terminal" },
-            ].map((tab) =>
-              h(
-                "button",
-                {
-                  key: tab.id,
-                  className: `miccord-subnav-btn ${activeSubTab === tab.id ? "active" : ""}`,
-                  onClick: () => setActiveSubTab(tab.id),
-                },
-                svgIconReact(tab.icon, 13),
-                tab.label
-              )
-            )
-          )
-        );
-
-      // ----------------------------------------------------------------------
-      // Tab 1: Dashboard
-      // ----------------------------------------------------------------------
-      const renderDashboard = () => {
-        return h(
-          "div",
-          { style: { display: "flex", flexDirection: "column", gap: "18px" } },
-          h(
-            "div",
-            { className: "miccord-stats-row" },
-            h(
-              "div",
-              { className: "miccord-stat-card" },
-              h("span", { className: "miccord-stat-value" }, `${enabledCount} / ${PLUGIN_DEFINITIONS.length}`),
-              h("span", { className: "miccord-stat-label" }, "Plugins Ativos")
-            ),
-            h(
-              "div",
-              { className: "miccord-stat-card" },
-              h(
-                "span",
-                { className: "miccord-stat-value" },
-                PRESET_THEMES.find((t) => t.id === state.settings.activeTheme)?.name || "Padrão"
-              ),
-              h("span", { className: "miccord-stat-label" }, "Tema Ativo")
-            ),
-            h(
-              "div",
-              { className: "miccord-stat-card" },
-              h("span", { className: "miccord-stat-value" }, `${state.messageLogs.length}`),
-              h("span", { className: "miccord-stat-label" }, "Mensagens Capturadas")
-            ),
-            h(
-              "div",
-              { className: "miccord-stat-card" },
-              h("span", { className: "miccord-stat-value" }, `${loadedModules} / ${totalModules}`),
-              h("span", { className: "miccord-stat-label" }, "Módulos Rspack Carregados")
-            )
-          ),
-
-          // macOS System Status Overview Card
-          h(
-            "div",
-            { className: "miccord-plugin-card enabled" },
-            h(
-              "div",
-              { className: "miccord-plugin-header" },
-              h(
-                "div",
-                { className: "miccord-plugin-title-wrap" },
-                h(
-                  "div",
-                  { className: "miccord-plugin-name" },
-                  svgIconReact("shield", 15),
-                  "Status do Sistema & Modificações Ativas",
-                  h("span", { className: "miccord-badge-pill" }, "OPERACIONAL")
-                ),
-                h(
-                  "div",
-                  { className: "miccord-plugin-author" },
-                  "Better MicUP Black Obsidian em execução no Micup Desktop"
-                )
-              )
-            ),
-            h(
-              "div",
-              { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "10px", marginTop: "8px" } },
-              h(
-                "div",
-                { style: { padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--miccord-border)", borderRadius: "8px" } },
-                h("div", { style: { display: "flex", alignItems: "center", gap: "8px", fontWeight: "600", fontSize: "12.5px", color: "#fff", marginBottom: "4px" } },
-                  svgIconReact("monitor", 14),
-                  "ScreenShare Plus Bypass"
-                ),
-                h("div", { style: { fontSize: "11.5px", color: "var(--miccord-text-muted)", lineHeight: "1.4" } },
-                  "Desbloqueado nativamente no app. Escolha qualquer qualidade ou FPS no seletor do Micup com bitrate desimpedido e Anti-Clamp automático."
-                )
-              ),
-              h(
-                "div",
-                { style: { padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--miccord-border)", borderRadius: "8px" } },
-                h("div", { style: { display: "flex", alignItems: "center", gap: "8px", fontWeight: "600", fontSize: "12.5px", color: "#fff", marginBottom: "4px" } },
-                  svgIconReact("shieldCheck", 14),
-                  "NoTrack & Privacidade"
-                ),
-                h("div", { style: { fontSize: "11.5px", color: "var(--miccord-text-muted)", lineHeight: "1.4" } },
-                  "Telemetria, analytics e relatórios de uso bloqueados no nível de rede e store interna."
-                )
-              ),
-              h(
-                "div",
-                { style: { padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--miccord-border)", borderRadius: "8px" } },
-                h("div", { style: { display: "flex", alignItems: "center", gap: "8px", fontWeight: "600", fontSize: "12.5px", color: "#fff", marginBottom: "4px" } },
-                  svgIconReact("history", 14),
-                  "Message Logger"
-                ),
-                h("div", { style: { fontSize: "11.5px", color: "var(--miccord-text-muted)", lineHeight: "1.4" } },
-                  "Mensagens excluídas e histórico de edições preservados em memória segura com selo visual no chat."
-                )
-              ),
-              h(
-                "div",
-                { style: { padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--miccord-border)", borderRadius: "8px" } },
-                h("div", { style: { display: "flex", alignItems: "center", gap: "8px", fontWeight: "600", fontSize: "12.5px", color: "#fff", marginBottom: "4px" } },
-                  svgIconReact("terminal", 14),
-                  "Developer Engine & F12"
-                ),
-                h("div", { style: { fontSize: "11.5px", color: "var(--miccord-text-muted)", lineHeight: "1.4" } },
-                  "Atalhos F12 (DevTools) e Ctrl+Shift+M (Better MicUP) habilitados. Rspack interceptado com sucesso."
-                )
-              ),
-              h(
-                "div",
-                { style: { padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--miccord-border)", borderRadius: "8px" } },
-                h("div", { style: { display: "flex", alignItems: "center", gap: "8px", fontWeight: "600", fontSize: "12.5px", color: "#fff", marginBottom: "4px" } },
-                  svgIconReact("volume2", 14),
-                  "Volume Individual Amplificado"
-                ),
-                h("div", { style: { fontSize: "11.5px", color: "var(--miccord-text-muted)", lineHeight: "1.4" } },
-                  "Amplificação de até 200% para participantes baixos via WebAudio GainNode nativo com zero clipping."
-                )
-              ),
-              h(
-                "div",
-                { style: { padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--miccord-border)", borderRadius: "8px" } },
-                h("div", { style: { display: "flex", alignItems: "center", gap: "8px", fontWeight: "600", fontSize: "12.5px", color: "#fff", marginBottom: "4px" } },
-                  svgIconReact("smile", 14),
-                  "Fake Plus & Emotes Livres"
-                ),
-                h("div", { style: { fontSize: "11.5px", color: "var(--miccord-text-muted)", lineHeight: "1.4" } },
-                  "Emojis customizados e stickers liberados globalmente sem necessidade de assinatura Plus."
-                )
-              ),
-              h(
-                "div",
-                { style: { padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--miccord-border)", borderRadius: "8px" } },
-                h("div", { style: { display: "flex", alignItems: "center", gap: "8px", fontWeight: "600", fontSize: "12.5px", color: "#fff", marginBottom: "4px" } },
-                  svgIconReact("shield", 14),
-                  "Auto-Patcher & Persistência"
-                ),
-                h("div", { style: { fontSize: "11.5px", color: "var(--miccord-text-muted)", lineHeight: "1.4" } },
-                  "Guardião em segundo plano ativo: monitora atualizações OTA do Micup e reaplica o Better MicUP automaticamente em milissegundos."
-                )
-              )
-            )
-          ),
-
-          // Export / Import Backup Card
-          h(
-            "div",
-            { className: "miccord-plugin-card" },
-            h(
-              "div",
-              { className: "miccord-plugin-name" },
-              svgIconReact("copy", 15),
-              "Backup & Restauração de Configurações"
-            ),
-            h(
-              "p",
-              { className: "miccord-plugin-desc" },
-              "Exporte seus plugins, temas e QuickCSS para a área de transferência ou restaure a configuração padrão."
-            ),
-            h(
-              "div",
-              { style: { display: "flex", gap: "10px", flexWrap: "wrap", marginTop: "8px" } },
-              h(
-                "button",
-                {
-                  className: "miccord-btn primary",
-                  onClick: () => {
-                    navigator.clipboard?.writeText(JSON.stringify(state.settings, null, 2));
-                    showToast("Configurações do Better MicUP copiadas para a área de transferência!", "success");
-                  },
-                },
-                svgIconReact("copy", 13),
-                "Copiar JSON de Configuração"
-              ),
-              h(
-                "button",
-                {
-                  className: "miccord-btn danger",
-                  onClick: () => {
-                    state.settings = structuredClone(DEFAULT_SETTINGS);
-                    saveSettings();
-                    syncStoreBasedPlugins();
-                    showToast("Configurações restauradas para o padrão!", "info");
-                  },
-                },
-                svgIconReact("rotateCcw", 13),
-                "Restaurar Padrões"
-              )
-            )
-          )
-        );
-      };
-
-      // ----------------------------------------------------------------------
-      // Tab 2: Plugins Grid
-      // ----------------------------------------------------------------------
-      const renderPlugins = () => {
-        const categories = ["ALL", ...new Set(PLUGIN_DEFINITIONS.map((p) => p.category))];
-        const filtered = PLUGIN_DEFINITIONS.filter((p) => {
-          const matchesCat = catFilter === "ALL" || p.category === catFilter;
-          const q = searchQuery.trim().toLowerCase();
-          const matchesSearch =
-            !q ||
-            p.name.toLowerCase().includes(q) ||
-            p.description.toLowerCase().includes(q) ||
-            p.category.toLowerCase().includes(q);
-          return matchesCat && matchesSearch;
-        });
-
-        return h(
-          "div",
-          { style: { display: "flex", flexDirection: "column", gap: "16px" } },
-          h(
-            "div",
-            { className: "miccord-toolbar" },
-            h("input", {
-              className: "miccord-search-input",
-              placeholder: "Pesquisar plugins por nome, função ou categoria...",
-              value: searchQuery,
-              onChange: (e) => setSearchQuery(e.target.value),
-            }),
-            h(
-              "div",
-              { className: "miccord-filter-group" },
-              categories.map((cat) =>
-                h(
-                  "button",
-                  {
-                    key: cat,
-                    className: `miccord-btn ${catFilter === cat ? "primary" : ""}`,
-                    onClick: () => setCatFilter(cat),
-                  },
-                  cat === "ALL" ? "Todos" : cat
-                )
-              )
-            )
-          ),
-          h(
-            "div",
-            { className: "miccord-plugin-grid" },
-            filtered.map((plugin) => {
-              const pState = state.settings.plugins[plugin.id] || { enabled: false };
-              const isEnabled = Boolean(pState.enabled);
-
-              return h(
-                "div",
-                {
-                  key: plugin.id,
-                  className: `miccord-plugin-card ${isEnabled ? "enabled" : ""}`,
-                },
-                h(
-                  "div",
-                  { style: { display: "flex", flexDirection: "column", gap: "8px" } },
-                  h(
-                    "div",
-                    { className: "miccord-plugin-header" },
-                    h(
-                      "div",
-                      { className: "miccord-plugin-title-wrap" },
-                      h(
-                        "div",
-                        { className: "miccord-plugin-name" },
-                        plugin.name,
-                        h("span", { className: "miccord-plugin-tag" }, plugin.category)
-                      ),
-                      h("span", { className: "miccord-plugin-author" }, `por ${plugin.author}`)
-                    ),
-                    h(
-                      "button",
-                      {
-                        className: `miccord-switch ${isEnabled ? "checked" : ""}`,
-                        onClick: () => onTogglePlugin(plugin.id),
-                        title: isEnabled ? "Desativar Plugin" : "Ativar Plugin",
-                      },
-                      h("span", { className: "miccord-switch-thumb" })
-                    )
-                  ),
-                  h("p", { className: "miccord-plugin-desc" }, plugin.description),
-
-                  // Render inline settings if plugin has schema and is enabled
-                  isEnabled &&
-                    plugin.settingsSchema &&
-                    plugin.settingsSchema.length > 0 &&
-                    h(
-                      "div",
-                      { className: "miccord-plugin-settings" },
-                      plugin.settingsSchema.map((field) =>
-                        h(
-                          "div",
-                          { key: field.key, className: "miccord-setting-row" },
-                          h("span", null, field.label),
-                          field.type === "boolean"
-                            ? h(
-                                "button",
-                                {
-                                  className: `miccord-switch ${pState[field.key] ? "checked" : ""}`,
-                                  onClick: () => onUpdatePluginSetting(plugin.id, field.key, !pState[field.key]),
-                                },
-                                h("span", { className: "miccord-switch-thumb" })
-                              )
-                            : field.type === "select"
-                            ? h(
-                                "select",
-                                {
-                                  className: "miccord-setting-select",
-                                  value: pState[field.key] ?? "",
-                                  onChange: (e) => onUpdatePluginSetting(plugin.id, field.key, e.target.value),
-                                },
-                                field.options.map((opt) =>
-                                  h(
-                                    "option",
-                                    {
-                                      key: opt.value,
-                                      value: opt.value,
-                                      style: { backgroundColor: "#18181c", color: "#ffffff" },
-                                    },
-                                    opt.label
-                                  )
-                                )
-                              )
-                            : h("input", {
-                                className: "miccord-setting-input",
-                                type: "text",
-                                value: pState[field.key] ?? "",
-                                onChange: (e) => onUpdatePluginSetting(plugin.id, field.key, e.target.value),
-                              })
-                        )
-                      )
-                    )
-                )
-              );
-            })
-          )
-        );
-      };
-
-      // ----------------------------------------------------------------------
-      // Tab 3: Themes & QuickCSS
-      // ----------------------------------------------------------------------
-      const renderThemes = () =>
-        h(
-          "div",
-          { style: { display: "flex", flexDirection: "column", gap: "20px" } },
-          h(
-            "div",
-            null,
-            h("h3", { style: { margin: "0 0 12px 0", fontSize: "15px", color: "#fff", display: "flex", alignItems: "center", gap: "8px" } }, svgIconReact("palette", 16), "Temas Integrados"),
-            h(
-              "div",
-              { className: "miccord-theme-grid" },
-              PRESET_THEMES.map((theme) => {
-                const isActive = state.settings.activeTheme === theme.id;
-                return h(
-                  "div",
-                  {
-                    key: theme.id,
-                    className: `miccord-theme-card ${isActive ? "active" : ""}`,
-                    onClick: () => {
-                      state.settings.activeTheme = theme.id;
-                      saveSettings();
-                      showToast(`Tema aplicado: ${theme.name}`, "success");
-                    },
-                  },
-                  h(
-                    "div",
-                    {
-                      className: "miccord-theme-preview",
-                      style: {
-                        background: `linear-gradient(135deg, ${theme.colors[0]} 0%, ${theme.colors[1]} 65%, ${theme.colors[2]} 100%)`,
-                      },
-                    },
-                    theme.colors.map((c, idx) =>
-                      h("span", {
-                        key: idx,
-                        className: "miccord-theme-swatch",
-                        style: { background: c },
-                      })
-                    )
-                  ),
-                  h(
-                    "div",
-                    { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
-                    h("strong", { style: { fontSize: "13.5px", color: "#fff" } }, theme.name),
-                    isActive && h("span", { className: "miccord-badge-pill" }, "ATIVO")
-                  ),
-                  h("p", { className: "miccord-plugin-desc", style: { fontSize: "11.5px" } }, theme.desc)
-                );
-              })
-            )
-          ),
-
-          // Live QuickCSS Editor
-          h(
-            "div",
-            { className: "miccord-plugin-card" },
-            h(
-              "div",
-              { className: "miccord-plugin-header" },
-              h(
-                "div",
-                { className: "miccord-plugin-title-wrap" },
-                h(
-                  "div",
-                  { className: "miccord-plugin-name" },
-                  svgIconReact("code", 16),
-                  "Editor QuickCSS em Tempo Real"
-                ),
-                h(
-                  "div",
-                  { className: "miccord-plugin-author" },
-                  "Qualquer regra CSS digitada abaixo é aplicada instantaneamente ao Micup"
-                )
-              ),
-              h(
-                "button",
-                {
-                  className: `miccord-switch ${state.settings.quickCssEnabled ? "checked" : ""}`,
-                  onClick: () => {
-                    state.settings.quickCssEnabled = !state.settings.quickCssEnabled;
-                    saveSettings();
-                  },
-                },
-                h("span", { className: "miccord-switch-thumb" })
-              )
-            ),
-            h("textarea", {
-              className: "miccord-css-editor",
-              value: state.settings.quickCss || "",
-              placeholder: "/* Exemplo: body { font-family: 'JetBrains Mono', monospace !important; } */",
-              onChange: (e) => {
-                state.settings.quickCss = e.target.value;
+            ConfirmButton,
+            {
+              onConfirm: () => {
+                state.settings = structuredClone(DEFAULT_SETTINGS);
                 saveSettings();
+                syncStoreBasedPlugins();
+                showToast("Configurações padrão restauradas.", "info");
               },
-            }),
-            h(
-              "div",
-              { style: { display: "flex", gap: "8px", justifyContent: "flex-end" } },
-              h(
-                "button",
-                {
-                  className: "miccord-btn",
-                  onClick: () => {
-                    state.settings.quickCss =
-                      "/* Miccord QuickCSS — Black Obsidian */\nimg[class*='avatar'] { border-radius: 8px !important; }\n";
-                    saveSettings();
-                    showToast("Snippet de exemplo inserido no QuickCSS!", "info");
-                  },
-                },
-                svgIconReact("code", 13),
-                "Inserir Snippet de Exemplo"
-              ),
-              h(
-                "button",
-                {
-                  className: "miccord-btn danger",
-                  onClick: () => {
-                    state.settings.quickCss = "";
-                    saveSettings();
-                  },
-                },
-                svgIconReact("eraser", 13),
-                "Limpar QuickCSS"
-              )
-            )
+            },
+            "Restaurar padrões"
           )
-        );
-
-      // ----------------------------------------------------------------------
-      // Tab 4: Message Logger History
-      // ----------------------------------------------------------------------
-      const renderMessageLogger = () => {
-        const channelStore = Webpack.getModule(811383)?.default;
-        const guildStore = Webpack.getModule(246151)?.default;
-
-        return h(
-          "div",
-          { style: { display: "flex", flexDirection: "column", gap: "14px" } },
+        ),
+        importing &&
           h(
             "div",
-            { className: "miccord-toolbar" },
-            h(
-              "div",
-              { style: { fontSize: "12.5px", color: "var(--miccord-text-muted)", display: "flex", alignItems: "center", gap: "6px" } },
-              svgIconReact("history", 14),
-              `Total registrado: ${state.messageLogs.length} eventos (mensagens apagadas e edições)`
-            ),
-            h(
-              "div",
-              { style: { display: "flex", gap: "8px" } },
-              h(
-                "button",
-                {
-                  className: "miccord-btn",
-                  onClick: () => {
-                    navigator.clipboard?.writeText(JSON.stringify(state.messageLogs, null, 2));
-                    showToast("Logs exportados para a área de transferência!", "success");
-                  },
-                },
-                svgIconReact("copy", 13),
-                "Exportar JSON"
-              ),
-              h(
-                "button",
-                {
-                  className: "miccord-btn danger",
-                  onClick: () => {
-                    state.messageLogs = [];
-                    saveMessageLogs();
-                    showToast("Histórico do MessageLogger limpo!", "info");
-                  },
-                },
-                svgIconReact("trash", 13),
-                "Limpar Histórico"
-              )
-            )
-          ),
-
-          state.messageLogs.length === 0
-            ? h(
-                "div",
-                {
-                  className: "miccord-plugin-card",
-                  style: { textAlign: "center", padding: "36px", color: "#9ca3af" },
-                },
-                "Nenhuma mensagem apagada ou editada foi capturada ainda nesta sessão. O MessageLogger está monitorando em segundo plano!"
-              )
-            : h(
-                "div",
-                { style: { display: "flex", flexDirection: "column", gap: "8px" } },
-                state.messageLogs.map((entry) => {
-                  const ch = channelStore?.getChannel?.(entry.channelId);
-                  const guild = entry.guildId ? guildStore?.getGuild?.(entry.guildId) : null;
-                  const locationLabel = guild
-                    ? `${guild.name} #${ch?.name || entry.channelId}`
-                    : ch?.name
-                    ? `#${ch.name}`
-                    : `Canal ${entry.channelId}`;
-
-                  return h(
-                    "div",
-                    {
-                      key: entry.id,
-                      className:
-                        entry.type === "deleted" ? "miccord-msg-deleted-card" : "miccord-msg-edited-card",
-                    },
-                    h(
-                      "div",
-                      {
-                        style: {
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          fontSize: "12px",
-                          color: "var(--miccord-text-secondary)",
-                        },
-                      },
-                      h(
-                        "div",
-                        { style: { display: "flex", alignItems: "center", gap: "7px" } },
-                        h(
-                          "span",
-                          {
-                            className: entry.type === "deleted" ? "miccord-badge-deleted" : "miccord-badge-edited",
-                          },
-                          entry.type === "deleted" ? "APAGADA" : "EDITADA"
-                        ),
-                        h("strong", { style: { color: "#ffffff" } }, `@${entry.author?.username || "usuário"}`),
-                        h("span", { style: { color: "var(--miccord-text-faint)" } }, `— ${locationLabel}`)
-                      ),
-                      h("span", { style: { fontFamily: "var(--miccord-font-mono)", fontSize: "11px", color: "var(--miccord-text-faint)" } }, new Date(entry.timestamp).toLocaleTimeString())
-                    ),
-                    entry.type === "edited" &&
-                      entry.oldContent &&
-                      h(
-                        "div",
-                        { style: { fontSize: "12px", color: "#fca5a5", textDecoration: "line-through" } },
-                        `Antes: ${entry.oldContent}`
-                      ),
-                    h(
-                      "div",
-                      { style: { fontSize: "13px", color: "#ffffff", whiteSpace: "pre-wrap" } },
-                      entry.content || "(Sem texto / Apenas anexo)"
-                    ),
-                    Array.isArray(entry.attachments) &&
-                      entry.attachments.length > 0 &&
-                      h(
-                        "div",
-                        { style: { fontSize: "11.5px", color: "var(--miccord-text-muted)" } },
-                        entry.attachments.map((a, i) =>
-                          h(
-                            "a",
-                            {
-                              key: i,
-                              href: a.url,
-                              target: "_blank",
-                              rel: "noreferrer",
-                              style: { display: "inline-flex", alignItems: "center", gap: "4px", marginRight: "10px", color: "#e4e4e7" },
-                            },
-                            svgIconReact("paperclip", 12),
-                            a.filename || a.url
-                          )
-                        )
-                      )
-                  );
-                })
-              )
-        );
-      };
-
-      // ----------------------------------------------------------------------
-      // Tab 5: Rspack Module Explorer & DevTools Console
-      // ----------------------------------------------------------------------
-      const renderDevTools = () => {
-        const q = rspackQuery.trim().toLowerCase();
-        const matchingModules = [];
-        if (Webpack.wreq?.m) {
-          for (const [id, factory] of Object.entries(Webpack.wreq.m)) {
-            if (matchingModules.length >= 40) break;
-            const loadedExp = Webpack.wreq.c?.[id]?.exports;
-            const keys = loadedExp && typeof loadedExp === "object" ? Object.keys(loadedExp) : [];
-            const defaultKeys =
-              loadedExp?.default && typeof loadedExp.default === "object"
-                ? Object.keys(loadedExp.default)
-                : loadedExp?.A && typeof loadedExp.A === "object"
-                ? Object.keys(loadedExp.A)
-                : [];
-            const allKeysStr = [...keys, ...defaultKeys].join(", ");
-
-            if (
-              !q ||
-              id.toLowerCase().includes(q) ||
-              allKeysStr.toLowerCase().includes(q) ||
-              Function.prototype.toString.call(factory).toLowerCase().includes(q)
-            ) {
-              matchingModules.push({
-                id,
-                loaded: Boolean(Webpack.wreq.c?.[id]),
-                keys: allKeysStr || "(função / primitivo)",
-              });
-            }
-          }
-        }
-
-        return h(
-          "div",
-          { style: { display: "flex", flexDirection: "column", gap: "18px" } },
-          // Interactive JS Eval Box
-          h(
-            "div",
-            { className: "miccord-plugin-card" },
-            h(
-              "div",
-              { className: "miccord-plugin-name" },
-              svgIconReact("terminal", 15),
-              "Console de Inspeção Runtime (Miccord API)"
-            ),
-            h("input", {
-              className: "miccord-search-input",
-              style: { fontFamily: "monospace", marginTop: "6px" },
-              value: evalInput,
-              onChange: (e) => setEvalInput(e.target.value),
+            { className: "bmu-field" },
+            h("textarea", {
+              className: "bmu-textarea is-short",
+              placeholder: "Cole aqui o JSON copiado com “Copiar configurações”",
+              value: importText,
+              spellCheck: false,
+              onChange: (e) => setImportText(e.target.value),
             }),
-            h(
-              "div",
-              { style: { display: "flex", gap: "8px", marginTop: "6px" } },
-              h(
-                "button",
-                {
-                  className: "miccord-btn primary",
-                  onClick: () => {
-                    try {
-                      const fn = new Function("Miccord", `return (${evalInput});`);
-                      const res = fn(window.Miccord);
-                      setEvalOutput(
-                        typeof res === "object" ? JSON.stringify(res, null, 2) : String(res)
-                      );
-                    } catch (err) {
-                      setEvalOutput(`Erro: ${err.message}`);
-                    }
-                  },
-                },
-                svgIconReact("play", 13),
-                "Executar Expressão"
-              ),
-              h(
-                "button",
-                {
-                  className: "miccord-btn",
-                  onClick: () => window.flx?.devtools?.open?.(),
-                },
-                svgIconReact("terminal", 13),
-                "Abrir Chromium DevTools"
-              )
-            ),
-            evalOutput &&
-              h(
-                "pre",
-                {
-                  style: {
-                    background: "#050507",
-                    border: "1px solid var(--miccord-border)",
-                    padding: "12px",
-                    borderRadius: "8px",
-                    fontSize: "12px",
-                    color: "#4ade80",
-                    fontFamily: "var(--miccord-font-mono)",
-                    maxHeight: "200px",
-                    overflow: "auto",
-                    margin: "6px 0 0 0",
-                  },
-                },
-                evalOutput
-              )
-          ),
-
-          // Rspack Module Searcher
-          h(
-            "div",
-            { className: "miccord-plugin-card" },
-            h(
-              "div",
-              { className: "miccord-plugin-name" },
-              svgIconReact("package", 15),
-              `Explorador de Módulos Rspack (${loadedModules} carregados de ${totalModules})`
-            ),
-            h("input", {
-              className: "miccord-search-input",
-              placeholder: "Pesquisar por ID do módulo (ex: 634368), export ou trecho de código...",
-              value: rspackQuery,
-              onChange: (e) => setRspackQuery(e.target.value),
-            }),
-            h(
-              "div",
-              {
-                style: {
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "6px",
-                  maxHeight: "300px",
-                  overflowY: "auto",
-                  marginTop: "8px",
-                },
-              },
-              matchingModules.map((m) =>
-                h(
-                  "div",
-                  {
-                    key: m.id,
-                    style: {
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      padding: "8px 12px",
-                      background: "var(--miccord-bg-surface-2)",
-                      border: "1px solid var(--miccord-border)",
-                      borderRadius: "6px",
-                      fontSize: "12px",
-                    },
-                  },
-                  h(
-                    "div",
-                    null,
-                    h("strong", { style: { color: "#ffffff", fontFamily: "var(--miccord-font-mono)" } }, `Módulo #${m.id} `),
-                    h(
-                      "span",
-                      { style: { color: m.loaded ? "var(--miccord-success)" : "var(--miccord-text-faint)", fontSize: "11px", fontWeight: "600" } },
-                      m.loaded ? "[Carregado]" : "[Lazy]"
-                    ),
-                    h("div", { style: { color: "var(--miccord-text-muted)", fontSize: "11px" } }, `Exports: ${m.keys}`)
-                  ),
-                  h(
-                    "button",
-                    {
-                      className: "miccord-btn",
-                      onClick: () => {
-                        const mod = Webpack.getModule(m.id);
-                        console.log(`[Miccord] Módulo #${m.id}:`, mod);
-                        showToast(`Módulo #${m.id} enviado ao console (F12)!`, "info");
-                      },
-                    },
-                    svgIconReact("terminal", 12),
-                    "Log no Console"
-                  )
-                )
-              )
-            )
+            h(Actions, null, h(Button, { variant: "primary", onClick: applyImport, disabled: !importText.trim() }, "Aplicar"))
           )
-        );
-      };
+      ),
+      h(Divider),
+      h(
+        Section,
+        { title: "Sobre" },
+        h(
+          "p",
+          { className: "bmu-section-desc" },
+          "Mod do Micup no estilo Vencord. Usar mods de cliente viola os termos de uso do Micup; use por sua conta e risco."
+        ),
+        h(
+          Actions,
+          null,
+          h("a", { className: "bmu-link-btn", href: REPO_URL, target: "_blank", rel: "noreferrer" }, "Código-fonte"),
+          h("a", { className: "bmu-link-btn", href: `${REPO_URL}/issues`, target: "_blank", rel: "noreferrer" }, "Reportar um problema")
+        )
+      )
+    );
+  }
 
+  // --------------------------------------------------------------------------
+  // Page: Plugins
+  // --------------------------------------------------------------------------
+  const PLUGIN_CATEGORY_ORDER = ["Voz e vídeo", "Mensagens", "Privacidade", "Sistema"];
+
+  function PluginOption({ plugin, field }) {
+    const cfg = state.settings.plugins[plugin.id] || {};
+    const set = (value) => setPluginOption(plugin.id, field.key, value);
+    if (field.type === "boolean") {
+      return h(Switch, { label: field.label, description: field.description, value: !!cfg[field.key], onChange: set });
+    }
+    if (field.type === "select") {
       return h(
         "div",
-        { className: "miccord-root" },
-        renderHeroAndSubnav(),
-        activeSubTab === "miccord_dashboard" && renderDashboard(),
-        activeSubTab === "miccord_plugins" && renderPlugins(),
-        activeSubTab === "miccord_themes" && renderThemes(),
-        activeSubTab === "miccord_msglogger" && renderMessageLogger(),
-        activeSubTab === "miccord_devtools" && renderDevTools()
+        { className: "bmu-field" },
+        h("div", { className: "bmu-field-label" }, field.label),
+        field.description && h("div", { className: "bmu-field-desc" }, field.description),
+        h(RadioList, { value: cfg[field.key], options: field.options, onChange: set })
       );
+    }
+    if (field.type === "text") {
+      return h(
+        "div",
+        { className: "bmu-field" },
+        h("div", { className: "bmu-field-label" }, field.label),
+        h(TextInput, { value: cfg[field.key], onChange: set, placeholder: field.placeholder })
+      );
+    }
+    return null;
+  }
+
+  function PluginRow({ plugin }) {
+    const cfg = state.settings.plugins[plugin.id] || {};
+    const options = plugin.settingsSchema || [];
+    return h(
+      "div",
+      { className: "bmu-plugin" + (cfg.enabled ? " is-on" : "") },
+      h(Switch, {
+        label: plugin.name,
+        description: plugin.description,
+        value: !!cfg.enabled,
+        onChange: (value) => setPluginEnabled(plugin.id, value),
+      }),
+      cfg.enabled &&
+        options.length > 0 &&
+        h(
+          "div",
+          { className: "bmu-plugin-options" },
+          options.map((field) => h(PluginOption, { key: field.key, plugin, field }))
+        )
+    );
+  }
+
+  function PluginsPage() {
+    const React = getReact();
+    useMiccordState();
+    const [query, setQuery] = React.useState("");
+    const [filter, setFilter] = React.useState("all");
+    const q = query.trim().toLowerCase();
+    const visible = PLUGIN_DEFINITIONS.filter((p) => {
+      const on = !!state.settings.plugins[p.id]?.enabled;
+      if (filter === "on" && !on) return false;
+      if (filter === "off" && on) return false;
+      return !q || `${p.name} ${p.description}`.toLowerCase().includes(q);
+    });
+    const categories = [
+      ...PLUGIN_CATEGORY_ORDER,
+      ...new Set(PLUGIN_DEFINITIONS.map((p) => p.category).filter((c) => !PLUGIN_CATEGORY_ORDER.includes(c))),
+    ];
+
+    return h(
+      React.Fragment,
+      null,
+      h(
+        "div",
+        { className: "bmu-toolbar" },
+        h(TextInput, { value: query, onChange: setQuery, placeholder: "Buscar plugins", className: "is-search" }),
+        h(Segmented, {
+          value: filter,
+          onChange: setFilter,
+          options: [
+            { value: "all", label: "Todos" },
+            { value: "on", label: "Ligados" },
+            { value: "off", label: "Desligados" },
+          ],
+        })
+      ),
+      categories.map((category) => {
+        const list = visible.filter((p) => p.category === category);
+        if (list.length === 0) return null;
+        return h(
+          Section,
+          { key: category, title: category },
+          list.map((plugin) => h(PluginRow, { key: plugin.id, plugin }))
+        );
+      }),
+      visible.length === 0 && h(Note, null, "Nenhum plugin encontrado."),
+      h(Note, null, "As mudanças valem na hora. Se algo não mudar, recarregue o Micup (Ctrl+R).")
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Page: Themes & QuickCSS
+  // --------------------------------------------------------------------------
+  const ORIGINAL_THEME = { id: "none", name: "Original do Micup", colors: ["#2b2d31", "#1e1f22", "#7c5cff"] };
+
+  function ThemesPage() {
+    const React = getReact();
+    useMiccordState();
+    const current = state.settings.activeTheme || "obsidian";
+    const themes = [ORIGINAL_THEME, ...PRESET_THEMES];
+
+    return h(
+      React.Fragment,
+      null,
+      h(
+        Section,
+        { title: "Tema", description: "Muda as cores do Micup inteiro." },
+        h(
+          "div",
+          { className: "bmu-theme-grid" },
+          themes.map((theme) =>
+            h(
+              "button",
+              {
+                key: theme.id,
+                type: "button",
+                className: "bmu-theme" + (current === theme.id ? " is-selected" : ""),
+                "aria-pressed": current === theme.id,
+                onClick: () => {
+                  state.settings.activeTheme = theme.id;
+                  saveSettings();
+                },
+              },
+              h(
+                "span",
+                { className: "bmu-theme-swatch" },
+                theme.colors.map((c, i) => h("span", { key: i, style: { background: c } }))
+              ),
+              h("span", { className: "bmu-theme-name" }, theme.name),
+              current === theme.id && h("span", { className: "bmu-theme-check" }, svgIconReact("check", 12, { strokeWidth: 3 }))
+            )
+          )
+        )
+      ),
+      h(Divider),
+      h(
+        Section,
+        { title: "QuickCSS", description: "Seu próprio CSS, aplicado por cima do Micup enquanto você digita." },
+        h(Switch, {
+          label: "Ativar QuickCSS",
+          value: !!state.settings.quickCssEnabled,
+          onChange: (value) => {
+            state.settings.quickCssEnabled = value;
+            saveSettings();
+          },
+        }),
+        h("textarea", {
+          className: "bmu-textarea is-code",
+          value: state.settings.quickCss || "",
+          spellCheck: false,
+          placeholder: "/* exemplo */\n.miccord-call-timer { color: #7c5cff; }",
+          onChange: (e) => {
+            state.settings.quickCss = e.target.value;
+            saveSettings();
+          },
+        }),
+        h(
+          Actions,
+          null,
+          h(
+            ConfirmButton,
+            {
+              onConfirm: () => {
+                state.settings.quickCss = "";
+                saveSettings();
+              },
+            },
+            "Apagar CSS"
+          )
+        )
+      )
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Page: Message Logger
+  // --------------------------------------------------------------------------
+  function MessageLoggerPage() {
+    const React = getReact();
+    useMiccordState();
+    const [filter, setFilter] = React.useState("all");
+    const enabled = !!state.settings.plugins.MessageLogger?.enabled;
+    const logs = state.messageLogs.filter((e) => filter === "all" || e.type === filter);
+    const channelStore = Webpack.getModule(811383)?.default;
+    const guildStore = Webpack.getModule(246151)?.default;
+
+    const where = (entry) => {
+      let ch = null;
+      let guild = null;
+      try {
+        ch = channelStore?.getChannel?.(entry.channelId);
+        guild = entry.guildId ? guildStore?.getGuild?.(entry.guildId) : null;
+      } catch {}
+      if (guild) return `${guild.name} › #${ch?.name || entry.channelId}`;
+      if (ch?.name) return `#${ch.name}`;
+      return "Mensagem direta";
     };
+
+    return h(
+      React.Fragment,
+      null,
+      h(
+        Section,
+        {
+          title: "Mensagens apagadas e editadas",
+          description: `Guardadas só neste computador (até ${state.settings.plugins.MessageLogger?.maxLogs || 250}).`,
+          actions:
+            state.messageLogs.length > 0 &&
+            h(
+              React.Fragment,
+              null,
+              h(
+                Button,
+                {
+                  onClick: () => {
+                    navigator.clipboard?.writeText(JSON.stringify(state.messageLogs, null, 2));
+                    showToast("Registro copiado.", "success");
+                  },
+                },
+                "Copiar"
+              ),
+              h(
+                ConfirmButton,
+                {
+                  onConfirm: () => {
+                    state.messageLogs = [];
+                    saveMessageLogs();
+                  },
+                },
+                "Limpar"
+              )
+            ),
+        },
+        !enabled &&
+          h(
+            "div",
+            { className: "bmu-callout" },
+            h("span", null, "O plugin Message Logger está desligado."),
+            h(Button, { variant: "primary", onClick: () => setPluginEnabled("MessageLogger", true) }, "Ligar")
+          ),
+        h(Segmented, {
+          value: filter,
+          onChange: setFilter,
+          options: [
+            { value: "all", label: `Todas (${state.messageLogs.length})` },
+            { value: "deleted", label: "Apagadas" },
+            { value: "edited", label: "Editadas" },
+          ],
+        }),
+        logs.length === 0
+          ? h(
+              "div",
+              { className: "bmu-empty" },
+              state.messageLogs.length === 0
+                ? "Nada por aqui ainda. Quando alguém apagar ou editar uma mensagem num canal que você viu, ela aparece aqui."
+                : "Nenhuma mensagem nesse filtro."
+            )
+          : h(
+              "div",
+              { className: "bmu-log-list" },
+              logs.map((entry) =>
+                h(
+                  "div",
+                  { key: entry.id, className: "bmu-log is-" + entry.type },
+                  h(
+                    "div",
+                    { className: "bmu-log-head" },
+                    h("span", { className: "bmu-log-author" }, entry.author?.global_name || entry.author?.username || "Desconhecido"),
+                    h("span", { className: "bmu-log-tag" }, entry.type === "deleted" ? "apagada" : "editada"),
+                    h("span", { className: "bmu-log-where" }, where(entry)),
+                    h(
+                      "time",
+                      { className: "bmu-log-time" },
+                      new Date(entry.timestamp).toLocaleString([], { dateStyle: "short", timeStyle: "short" })
+                    )
+                  ),
+                  entry.type === "edited" && entry.oldContent && h("div", { className: "bmu-log-old" }, entry.oldContent),
+                  h("div", { className: "bmu-log-content" }, entry.content || h("em", null, "(sem texto)")),
+                  Array.isArray(entry.attachments) &&
+                    entry.attachments.length > 0 &&
+                    h(
+                      "div",
+                      { className: "bmu-log-files" },
+                      entry.attachments.map((a, i) =>
+                        h("a", { key: i, href: a.url, target: "_blank", rel: "noreferrer" }, a.filename || "anexo")
+                      )
+                    )
+                )
+              )
+            )
+      )
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Page: Developer
+  // --------------------------------------------------------------------------
+  const SCREEN_EVENT_LABELS = {
+    "capture-started": "Compartilhamento iniciado",
+    "capture-ended-by-source": "O Windows encerrou a captura",
+    "encoder-stall-reported": "Micup achou que o encoder travou",
+    "encoder-stall-false-alarm": "Alarme falso do encoder (stream mantido)",
+    "encoder-stall-confirmed": "Encoder travou de verdade",
+  };
+
+  function DeveloperPage() {
+    const React = getReact();
+    useMiccordState();
+    const [query, setQuery] = React.useState("");
+    const [code, setCode] = React.useState("Miccord.state.settings");
+    const [output, setOutput] = React.useState("");
+    const [, refresh] = React.useReducer((x) => x + 1, 0);
+    const events = readScreenShareEvents().slice(0, 12);
+    const total = Object.keys(Webpack.factories || {}).length;
+    const loaded = Object.keys(Webpack.cache || {}).length;
+
+    const q = query.trim().toLowerCase();
+    const results = [];
+    if (q.length >= 2 && Webpack.wreq?.m) {
+      for (const id of Object.keys(Webpack.wreq.m)) {
+        if (results.length >= 30) break;
+        let keys = [];
+        try {
+          const exp = Webpack.wreq.c?.[id]?.exports;
+          if (exp && typeof exp === "object") keys = Object.keys(exp);
+        } catch {}
+        if (id.includes(q) || keys.some((k) => k.toLowerCase().includes(q))) results.push({ id, keys });
+      }
+    }
+
+    const run = () => {
+      try {
+        const fn = new Function("Miccord", `return (${code});`);
+        const value = fn(window.Miccord);
+        setOutput(typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? String(value));
+      } catch (e) {
+        setOutput(`Erro: ${e.message}`);
+      }
+    };
+
+    return h(
+      React.Fragment,
+      null,
+      h(
+        Section,
+        { title: "Ferramentas" },
+        h(
+          Actions,
+          null,
+          h(Button, { onClick: () => window.flx?.devtools?.open?.() }, "Abrir DevTools"),
+          h(Button, { onClick: () => location.reload() }, "Recarregar o Micup")
+        )
+      ),
+      h(Divider),
+      h(
+        Section,
+        {
+          title: "Diagnóstico do compartilhamento de tela",
+          description: "Os últimos eventos de compartilhamento, para entender por que um stream caiu.",
+          actions:
+            events.length > 0 &&
+            h(
+              Button,
+              {
+                onClick: () => {
+                  localStorage.removeItem(SS_EVENTS_KEY);
+                  refresh();
+                },
+              },
+              "Limpar"
+            ),
+        },
+        events.length === 0
+          ? h("div", { className: "bmu-empty" }, "Nenhum compartilhamento registrado ainda.")
+          : h(
+              "div",
+              { className: "bmu-event-list" },
+              events.map((ev, i) =>
+                h(
+                  "div",
+                  { key: i, className: "bmu-event" },
+                  h("time", null, new Date(ev.at).toLocaleString([], { dateStyle: "short", timeStyle: "medium" })),
+                  h("span", null, SCREEN_EVENT_LABELS[ev.type] || ev.type),
+                  ev.surface && h("span", { className: "bmu-muted" }, ev.surface === "window" ? "janela" : ev.surface)
+                )
+              )
+            )
+      ),
+      h(Divider),
+      h(
+        Section,
+        { title: "Módulos do Micup", description: `${loaded} de ${total} módulos carregados. Busque por número ou por nome de export.` },
+        h(TextInput, { value: query, onChange: setQuery, placeholder: "Ex.: 166190 ou getCurrentUser", className: "is-search" }),
+        results.length > 0 &&
+          h(
+            "div",
+            { className: "bmu-module-list" },
+            results.map((m) =>
+              h(
+                "div",
+                { key: m.id, className: "bmu-module" },
+                h("code", null, m.id),
+                h("span", { className: "bmu-muted" }, m.keys.slice(0, 8).join(", ") || "(não carregado)"),
+                h(
+                  Button,
+                  {
+                    onClick: () => {
+                      console.log(`[Miccord] módulo ${m.id}:`, Webpack.getModule(m.id, true));
+                      showToast(`Módulo ${m.id} enviado ao console (F12).`, "info");
+                    },
+                  },
+                  "Console"
+                )
+              )
+            )
+          ),
+        q.length >= 2 && results.length === 0 && h(Note, null, "Nada encontrado.")
+      ),
+      h(Divider),
+      h(
+        Section,
+        { title: "Console", description: "Avalia uma expressão JavaScript com acesso a Miccord." },
+        h("textarea", {
+          className: "bmu-textarea is-code is-short",
+          value: code,
+          spellCheck: false,
+          onChange: (e) => setCode(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+              e.preventDefault();
+              run();
+            }
+          },
+        }),
+        h(Actions, null, h(Button, { variant: "primary", onClick: run }, "Executar (Ctrl+Enter)")),
+        output && h("pre", { className: "bmu-output" }, output)
+      )
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Tab → page
+  // --------------------------------------------------------------------------
+  const MICCORD_PAGES = {
+    miccord_dashboard: GeneralPage,
+    miccord_plugins: PluginsPage,
+    miccord_themes: ThemesPage,
+    miccord_msglogger: MessageLoggerPage,
+    miccord_devtools: DeveloperPage,
+  };
+
+  const MICCORD_PAGE_TITLES = {
+    miccord_dashboard: "Better MicUP",
+    miccord_plugins: "Plugins",
+    miccord_themes: "Temas",
+    miccord_msglogger: "Message Logger",
+    miccord_devtools: "Desenvolvedor",
+  };
+
+  function createMiccordSettingsComponent(initialTabType = "miccord_dashboard") {
+    // Inside Micup's settings each sidebar tab is its own page (no navigation of our own).
+    return function MiccordSettingsPage(props) {
+      if (!getReact()) return null;
+      const tab =
+        typeof props?.settingsTabType === "string" && MICCORD_PAGES[props.settingsTabType]
+          ? props.settingsTabType
+          : initialTabType;
+      return h("div", { className: "bmu-page" }, ErrorBoundaryFor(MICCORD_PAGES[tab] || GeneralPage));
+    };
+  }
+
+  // Used only by the standalone window (Ctrl+Shift+M when the settings tabs aren't available),
+  // which has no Micup sidebar, so it carries a small tab bar.
+  function MiccordStandaloneView({ initialTab }) {
+    const React = getReact();
+    const [tab, setTab] = React.useState(MICCORD_PAGES[initialTab] ? initialTab : "miccord_dashboard");
+    return h(
+      "div",
+      { className: "bmu-page is-standalone" },
+      h(Segmented, {
+        value: tab,
+        onChange: setTab,
+        options: Object.keys(MICCORD_PAGES).map((value) => ({ value, label: MICCORD_PAGE_TITLES[value] })),
+      }),
+      ErrorBoundaryFor(MICCORD_PAGES[tab])
+    );
   }
 
   // ==========================================================================
@@ -3678,6 +3786,58 @@
   let floatingWidgetEl = null;
   let standaloneModalEl = null;
   let lightboxEl = null;
+
+  // CallTimer ----------------------------------------------------------------
+  // Start/stop comes from our own VOICE_STATE_UPDATE payloads (onVoiceChannelChange). If the mod
+  // loaded mid-call there is no payload yet, so the panel's appearance starts the count instead.
+  const CALL_PANEL_ROW = '[data-flx$="voice-connection-status-inner.channel-source-row"]';
+  let callTimerFromPanel = false;
+
+  function onVoiceChannelChange(channelId) {
+    if (channelId) {
+      if (state.currentVoiceChannelId !== channelId) {
+        state.currentVoiceChannelId = channelId;
+        state.callStartTime = Date.now();
+        callTimerFromPanel = false;
+        notifyUI();
+      }
+    } else if (state.currentVoiceChannelId || state.callStartTime) {
+      state.currentVoiceChannelId = null;
+      state.callStartTime = null;
+      callTimerFromPanel = false;
+      notifyUI();
+    }
+  }
+
+  function renderCallTimer() {
+    const row = document.querySelector(CALL_PANEL_ROW);
+    let el = document.querySelector(".miccord-call-timer");
+    if (!row) {
+      el?.remove();
+      if (callTimerFromPanel) {
+        state.callStartTime = null;
+        callTimerFromPanel = false;
+      }
+      return;
+    }
+    if (!state.settings.plugins.CallTimer?.enabled) {
+      el?.remove();
+      return;
+    }
+    if (!state.callStartTime) {
+      state.callStartTime = Date.now();
+      callTimerFromPanel = true;
+    }
+    if (!el || el.parentElement !== row) {
+      el?.remove();
+      el = document.createElement("span");
+      el.className = "miccord-call-timer";
+      el.title = "Tempo na chamada (Better MicUP)";
+      row.appendChild(el);
+    }
+    const text = formatDuration(Date.now() - state.callStartTime);
+    if (el.textContent !== text) el.textContent = text;
+  }
 
   function formatDuration(ms) {
     const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -3775,7 +3935,6 @@
       <div style="display:flex;align-items:center;gap:8px;font-weight:600;color:#fff;font-size:13px;letter-spacing:-0.01em;">
         ${svgIconHtml("zap", 15)}
         <span>Better MicUP</span>
-        <span class="miccord-badge-pill">Configurações Micup</span>
       </div>
       <button class="miccord-modal-close-icon" id="miccord-modal-close" title="Fechar (ESC)">
         ${svgIconHtml("x", 16)}
@@ -3793,11 +3952,16 @@
     // Try rendering with Micup's React + ReactDOM (`193204` or `13706`)
     try {
       const React = getReact();
-      const ReactDOMClient = Webpack.findByProps("createRoot") || Webpack.getModule(193204);
+      // react-dom/client (only createRoot survives tree-shaking); its createRoot checks nodeType.
+      const ReactDOMClient = Webpack.findExport(
+        (o) =>
+          typeof o === "object" &&
+          typeof o.createRoot === "function" &&
+          Function.prototype.toString.call(o.createRoot).includes("nodeType")
+      ) || Webpack.getModule(193204);
       if (React && ReactDOMClient && typeof ReactDOMClient.createRoot === "function") {
-        const Comp = createMiccordSettingsComponent(state.modalTab);
         const root = ReactDOMClient.createRoot(body);
-        root.render(React.createElement(Comp, { settingsTabType: state.modalTab }));
+        root.render(React.createElement(MiccordStandaloneView, { initialTab: state.modalTab }));
         return;
       }
     } catch (e) {
@@ -3874,6 +4038,14 @@
     } catch {}
 
     // Update CallTimer display every second when in a call
+    setInterval(() => {
+      try {
+        renderCallTimer();
+      } catch (e) {
+        Logger.warn("CallTimer:", e);
+      }
+    }, 1000);
+
     // Global Keyboard Shortcuts
     window.addEventListener(
       "keydown",

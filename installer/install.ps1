@@ -133,7 +133,15 @@ function Install-BetterMicUP {
     if ($applied.Count -eq 0 -and $failed.Count -eq 0) { Ok "o Micup já estava com esta versão do mod" }
 
     if (-not $NoStart) {
-        Start-Process -FilePath "wscript.exe" -ArgumentList "`"$(Join-Path $InstallDir 'guard.vbs')`""
+        # Started through WMI so the guard is not a child of whatever ran the installer (a
+        # terminal, a launcher's job object...) and doesn't die when that closes.
+        $guardCmd = "wscript.exe `"$(Join-Path $InstallDir 'guard.vbs')`""
+        $started = $false
+        try {
+            $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $guardCmd }
+            $started = ($r.ReturnValue -eq 0)
+        } catch {}
+        if (-not $started) { Start-Process -FilePath "wscript.exe" -ArgumentList "`"$(Join-Path $InstallDir 'guard.vbs')`"" }
         Ok "guard rodando em segundo plano"
     }
 
