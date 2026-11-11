@@ -11,8 +11,21 @@ export const guardPath = path.join(root, "src", "guard.ps1");
 
 // The private key never goes into the repository. Back it up: without it you cannot
 // publish updates that already-installed copies will accept.
-export const keyPath =
-  process.env.BETTERMICUP_KEY || path.join(os.homedir(), ".better-micup", "release-key.pem");
+export const keyDir = path.join(os.homedir(), ".better-micup");
+const defaultKeyPath = path.join(keyDir, "release-key.pem");
+
+// BETTERMICUP_KEY wins; otherwise release-key.pem, or the only .pem in ~/.better-micup
+// (so a renamed backup copy still works).
+function findKeyPath() {
+  if (process.env.BETTERMICUP_KEY) return process.env.BETTERMICUP_KEY;
+  if (fs.existsSync(defaultKeyPath)) return defaultKeyPath;
+  try {
+    const pems = fs.readdirSync(keyDir).filter((f) => f.toLowerCase().endsWith(".pem"));
+    if (pems.length === 1) return path.join(keyDir, pems[0]);
+  } catch {}
+  return defaultKeyPath;
+}
+export const keyPath = findKeyPath();
 
 export function readVersion() {
   const js = fs.readFileSync(path.join(root, "src", "miccord.js"), "utf8");

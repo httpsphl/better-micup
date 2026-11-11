@@ -8,6 +8,14 @@ import { keyPath, publicKeyXml, readEmbeddedPublicKeyXml, writeEmbeddedPublicKey
 
 if (fs.existsSync(keyPath)) {
   console.log(`Usando a chave existente: ${keyPath}`);
+} else if (readEmbeddedPublicKeyXml().includes("<Modulus>") && !process.argv.includes("--replace-key")) {
+  // A key is already in use: the guards out there only accept releases signed with it.
+  console.error(`ERRO: não achei a chave privada (${keyPath}), mas src/guard.ps1 já tem uma chave pública.`);
+  console.error("Gerar outra faria todas as instalações existentes recusarem as próximas atualizações.");
+  console.error("Ache o arquivo .pem (backup, outro nome) e use BETTERMICUP_KEY=caminho para apontar para ele.");
+  console.error("Só se a chave antiga foi perdida de vez: node scripts/keygen.mjs --replace-key");
+  console.error("(aí todos precisarão reinstalar com o instalador novo).");
+  process.exit(1);
 } else {
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 3072, publicExponent: 0x10001 });
   fs.mkdirSync(path.dirname(keyPath), { recursive: true });

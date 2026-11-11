@@ -34,7 +34,13 @@ const tag = `v${version}`;
 const repo = readRepo();
 
 // 1. The key must match the public key that installed guards trust.
-if (!fs.existsSync(keyPath)) fail(`chave de assinatura não encontrada em ${keyPath}. Rode: node scripts/keygen.mjs`);
+if (!fs.existsSync(keyPath)) {
+  fail(
+    `chave de assinatura não encontrada (procurei ${keyPath}).\n` +
+      `Se você moveu ou renomeou a chave, aponte para ela: set BETTERMICUP_KEY=C:\\caminho\\da\\chave.pem\n` +
+      `NÃO gere uma chave nova: as instalações existentes só aceitam a chave atual.`
+  );
+}
 const privateKey = createPrivateKey(fs.readFileSync(keyPath));
 if (publicKeyXml(privateKey) !== readEmbeddedPublicKeyXml()) {
   fail("a chave pública em src/guard.ps1 não corresponde à sua chave privada. Rode: node scripts/keygen.mjs");
