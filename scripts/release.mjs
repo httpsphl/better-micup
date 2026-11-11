@@ -20,8 +20,9 @@ const option = (name) => {
 const dryRun = flag("--dry-run");
 const notes = option("--notes") || "";
 
+// (with stdio: "inherit" execFileSync returns null)
 const run = (cmd, cmdArgs, opts = {}) =>
-  execFileSync(cmd, cmdArgs, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts }).trim();
+  (execFileSync(cmd, cmdArgs, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts }) ?? "").trim();
 
 function fail(msg) {
   console.error(`\nERRO: ${msg}`);
