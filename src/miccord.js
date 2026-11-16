@@ -15,7 +15,7 @@
   if (window.__MICCORD_INITIALIZED__) return;
   window.__MICCORD_INITIALIZED__ = true;
 
-  const VERSION = "1.0.3";
+  const VERSION = "1.0.4";
   const STORAGE_KEY = "miccord_settings_v1";
   const MSGLOG_KEY = "miccord_message_logs_v1";
   const SS_EVENTS_KEY = "miccord_screenshare_events_v1";
@@ -80,6 +80,92 @@
     } catch {
       return [];
     }
+  }
+
+  // Micup's preload exposes `window.electron.toggleDevTools()` (older builds: window.flx).
+  function openDevTools() {
+    if (typeof window.electron?.toggleDevTools === "function") window.electron.toggleDevTools();
+    else window.flx?.devtools?.open?.();
+  }
+
+  // Last errors seen in the page (Micup's console.error and uncaught errors), shown on the
+  // Desenvolvedor page. Micup's CSP forbids eval, so this replaces an in-page JS console.
+  const recentErrors = [];
+  function pushRecentError(source, args) {
+    try {
+      const text = args
+        .map((a) => {
+          if (a instanceof Error) return a.stack || a.message;
+          if (typeof a === "string") return a;
+          try {
+            return JSON.stringify(a);
+          } catch {
+            return String(a);
+          }
+        })
+        .join(" ")
+        .slice(0, 800);
+      recentErrors.unshift({ at: new Date().toISOString(), source, text });
+      if (recentErrors.length > 40) recentErrors.length = 40;
+    } catch {}
+  }
+  (function captureErrors() {
+    const original = console.error;
+    console.error = function (...args) {
+      pushRecentError("console", args);
+      return original.apply(this, args);
+    };
+    window.addEventListener("error", (e) => pushRecentError("erro", [e.error || e.message]));
+    window.addEventListener("unhandledrejection", (e) => pushRecentError("promise", [e.reason]));
+  })();
+
+  // Snapshot of the voice call area, to debug "the call view is blank".
+  function inspectCallView() {
+    const size = (el) => {
+      if (!el) return null;
+      const b = el.getBoundingClientRect();
+      return `${Math.round(b.width)}x${Math.round(b.height)}`;
+    };
+    const flxIn = (root) =>
+      root
+        ? [...new Set([...root.querySelectorAll("[data-flx]")].map((e) => e.getAttribute("data-flx").split(".").slice(1, 3).join(".")))].slice(0, 40)
+        : [];
+    const view = document.querySelector('[data-flx*="voice-call-view-inner"]');
+    const layout = document.querySelector('[data-flx*="voice-call-layout-content"]');
+    const style = layout ? getComputedStyle(layout) : null;
+    let webgl2 = null;
+    try {
+      webgl2 = !!document.createElement("canvas").getContext("webgl2");
+    } catch (e) {
+      webgl2 = String(e);
+    }
+    // Micup's "Show non-video participants" (call ⋯ menu): when off, the grid only shows
+    // people with camera or screen share, which looks like a black call area.
+    let showNonVideoParticipants = null;
+    try {
+      const voiceSettings = Webpack.findExport(
+        (o) => typeof o === "object" && typeof o.getShowNonVideoParticipants === "function"
+      );
+      if (voiceSettings) showNonVideoParticipants = voiceSettings.getShowNonVideoParticipants();
+    } catch {}
+    return {
+      hint:
+        showNonVideoParticipants === false
+          ? "“Show non-video participants” está desligado (menu ⋯ da chamada): só aparece quem tem câmera ou tela."
+          : undefined,
+      showNonVideoParticipants,
+      inCall: !!view,
+      viewSize: size(view),
+      layoutSize: size(layout),
+      layoutStyle: style ? `${style.display}/${style.visibility}/${style.opacity}` : null,
+      tiles: document.querySelectorAll('[data-flx*="voice-participant-tile"]').length,
+      layoutChildren: flxIn(layout || view),
+      canvases: [...document.querySelectorAll("canvas")]
+        .map((c) => `${c.closest("[data-flx]")?.getAttribute("data-flx") || "?"} ${size(c)}`)
+        .slice(0, 10),
+      rooms: [...new Set([...document.querySelectorAll('[data-flx*="room"]')].map((e) => e.getAttribute("data-flx")))].slice(0, 15),
+      webgl2,
+    };
   }
 
   // ==========================================================================
@@ -3601,8 +3687,7 @@
     const React = getReact();
     useMiccordState();
     const [query, setQuery] = React.useState("");
-    const [code, setCode] = React.useState("Miccord.state.settings");
-    const [output, setOutput] = React.useState("");
+    const [callReport, setCallReport] = React.useState("");
     const [, refresh] = React.useReducer((x) => x + 1, 0);
     const events = readScreenShareEvents().slice(0, 12);
     const total = Object.keys(Webpack.factories || {}).length;
@@ -3622,15 +3707,7 @@
       }
     }
 
-    const run = () => {
-      try {
-        const fn = new Function("Miccord", `return (${code});`);
-        const value = fn(window.Miccord);
-        setOutput(typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? String(value));
-      } catch (e) {
-        setOutput(`Erro: ${e.message}`);
-      }
-    };
+    const errors = recentErrors.slice(0, 10);
 
     return h(
       React.Fragment,
@@ -3641,7 +3718,7 @@
         h(
           Actions,
           null,
-          h(Button, { onClick: () => window.flx?.devtools?.open?.() }, "Abrir DevTools"),
+          h(Button, { onClick: openDevTools }, "Abrir DevTools"),
           h(Button, { onClick: () => location.reload() }, "Recarregar o Micup")
         )
       ),
@@ -3713,21 +3790,61 @@
       h(Divider),
       h(
         Section,
-        { title: "Console", description: "Avalia uma expressão JavaScript com acesso a Miccord." },
-        h("textarea", {
-          className: "bmu-textarea is-code is-short",
-          value: code,
-          spellCheck: false,
-          onChange: (e) => setCode(e.target.value),
-          onKeyDown: (e) => {
-            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-              e.preventDefault();
-              run();
-            }
-          },
-        }),
-        h(Actions, null, h(Button, { variant: "primary", onClick: run }, "Executar (Ctrl+Enter)")),
-        output && h("pre", { className: "bmu-output" }, output)
+        {
+          title: "Tela da chamada",
+          description: "Se a área da chamada ficar em branco ou preta, entre na chamada, abra esta página e analise.",
+          actions: h(
+            React.Fragment,
+            null,
+            h(Button, { onClick: () => setCallReport(JSON.stringify(inspectCallView(), null, 2)) }, "Analisar"),
+            callReport &&
+              h(
+                Button,
+                {
+                  onClick: () => {
+                    navigator.clipboard?.writeText(callReport);
+                    showToast("Diagnóstico copiado.", "success");
+                  },
+                },
+                "Copiar"
+              )
+          ),
+        },
+        callReport && h("pre", { className: "bmu-output" }, callReport)
+      ),
+      h(Divider),
+      h(
+        Section,
+        {
+          title: "Erros recentes",
+          description: "Os últimos erros registrados pelo Micup desde que ele abriu.",
+          actions:
+            errors.length > 0 &&
+            h(
+              Button,
+              {
+                onClick: () => {
+                  navigator.clipboard?.writeText(JSON.stringify(recentErrors, null, 2));
+                  showToast("Erros copiados.", "success");
+                },
+              },
+              "Copiar todos"
+            ),
+        },
+        errors.length === 0
+          ? h("div", { className: "bmu-empty" }, "Nenhum erro registrado.")
+          : h(
+              "div",
+              { className: "bmu-event-list" },
+              errors.map((err, i) =>
+                h(
+                  "div",
+                  { key: i, className: "bmu-event is-error" },
+                  h("time", null, new Date(err.at).toLocaleTimeString()),
+                  h("span", { className: "bmu-errline" }, err.text)
+                )
+              )
+            )
       )
     );
   }
@@ -4073,7 +4190,7 @@
           (e.key === "F12" || (e.ctrlKey && e.shiftKey && e.code === "KeyI"))
         ) {
           e.preventDefault();
-          window.flx?.devtools?.open?.();
+          openDevTools();
           return;
         }
       },
@@ -4104,6 +4221,10 @@
     get screenShareEvents() {
       return readScreenShareEvents();
     },
+    get recentErrors() {
+      return recentErrors.slice();
+    },
+    inspectCallView,
     saveSettings,
     showToast,
     openSettings: openMiccordSettingsModal,

@@ -970,3 +970,19 @@ html[data-miccord-theme="midnight"] button[class*="Button_module__button"][class
   content: "·";
   margin-right: 6px;
 }
+
+/* Developer page: recent errors */
+.bmu-event.is-error {
+  align-items: flex-start;
+}
+
+.bmu-errline {
+  min-width: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary, #c7c7cc);
+  max-height: 120px;
+  overflow: auto;
+}
