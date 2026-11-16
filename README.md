@@ -11,7 +11,8 @@ itself when a new version is released.
 - Settings integrated into **Micup › Settings**, built with Micup's own switches and buttons:
   Better MicUP, Plugins, Temas, Message Logger and Desenvolvedor pages
 - **Plugins**
-  - **ScreenShare Plus**: Plus resolutions and frame rates for screen sharing, higher bitrate
+  - **ScreenShare Plus**: Plus resolutions and frame rates for screen sharing, holds the chosen
+    frame rate under load (lowers resolution instead), automatic bitrate, live stream-health meter
   - **Volume Booster**: per-user volume above 100%
   - **Call Timer**: call duration next to the channel name in the voice panel
   - **Message Logger**: keeps deleted messages and the previous text of edited ones

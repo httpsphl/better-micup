@@ -15,7 +15,7 @@
   if (window.__MICCORD_INITIALIZED__) return;
   window.__MICCORD_INITIALIZED__ = true;
 
-  const VERSION = "1.0.4";
+  const VERSION = "1.0.5";
   const STORAGE_KEY = "miccord_settings_v1";
   const MSGLOG_KEY = "miccord_message_logs_v1";
   const SS_EVENTS_KEY = "miccord_screenshare_events_v1";
@@ -80,6 +80,406 @@
     } catch {
       return [];
     }
+  }
+
+  // Micup's voice/video settings store (module 844865). Its export name changes between builds
+  // (`Ay` up to 1.0.33, `A` in 1.0.34), so recognise it by shape.
+  function pickVoiceSettingsStore(exports) {
+    if (!exports || typeof exports !== "object") return null;
+    const looksRight = (o) =>
+      !!o &&
+      typeof o === "object" &&
+      typeof o.updateSettings === "function" &&
+      ("screenshareResolution" in o || typeof o.getScreenshareResolution === "function");
+    for (const key of ["Ay", "A", "default"]) if (looksRight(exports[key])) return exports[key];
+    for (const key of Object.keys(exports)) if (looksRight(exports[key])) return exports[key];
+    return null;
+  }
+
+  // ==========================================================================
+  // Stream health: live WebRTC stats of what we send and what we watch.
+  // ==========================================================================
+  // Screen-share tracks from getDisplayMedia, to tell the screen apart from the camera.
+  const screenShareTracks = new Set();
+  // FPS the screen share is meant to run at (set by the ScreenShare Plus hooks).
+  let screenShareTargetFps = null;
+
+  function noteScreenShareTrack(track) {
+    if (!track) return;
+    screenShareTracks.add(track);
+    scheduleStreamHealth(1000);
+  }
+
+  function liveScreenShareTracks() {
+    for (const t of screenShareTracks) if (t.readyState === "ended") screenShareTracks.delete(t);
+    return [...screenShareTracks];
+  }
+
+  // Every RTCPeerConnection LiveKit opens (one to publish, one to subscribe). We run before the
+  // bundle, so wrapping the constructor sees all of them; instanceof and statics still work.
+  const peerConnections = new Set();
+  (function trackPeerConnections() {
+    try {
+      const Native = window.RTCPeerConnection;
+      if (typeof Native !== "function" || Native.__miccordTracked) return;
+      const Tracked = new Proxy(Native, {
+        construct(target, args, newTarget) {
+          const pc = Reflect.construct(target, args, newTarget === Tracked ? target : newTarget);
+          peerConnections.add(pc);
+          return pc;
+        },
+      });
+      Native.__miccordTracked = true;
+      window.RTCPeerConnection = Tracked;
+    } catch (e) {
+      console.warn("[Miccord] Não foi possível acompanhar as conexões de vídeo:", e);
+    }
+  })();
+
+  const finite = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const codecName = (mime) => {
+    const m = String(mime || "").toLowerCase().replace("video/", "");
+    return m === "av1x" ? "av1" : m === "hevc" ? "h265" : m || null;
+  };
+  // Chrome only reports powerEfficientEncoder when it knows; names help when it doesn't.
+  const SOFTWARE_CODER = /libvpx|libaom|openh264|dav1d|ffmpeg|software/i;
+  const isHardwareCoder = (name, powerEfficient) =>
+    typeof powerEfficient === "boolean" ? powerEfficient : name ? !SOFTWARE_CODER.test(name) : null;
+
+  const statsMemory = new WeakMap(); // pc -> Map(key -> { value, ts })
+
+  async function collectStreamHealth() {
+    const snap = { at: Date.now(), sending: [], receiving: [], uplinkKbps: null, rttMs: null };
+    const screenIds = new Set(liveScreenShareTracks().map((t) => t.id));
+    for (const pc of [...peerConnections]) {
+      if (pc.signalingState === "closed" || pc.connectionState === "closed") {
+        peerConnections.delete(pc);
+        continue;
+      }
+      let report;
+      try {
+        report = await pc.getStats();
+      } catch {
+        continue;
+      }
+      const stats = new Map();
+      report.forEach((s) => stats.set(s.id, s));
+      let memory = statsMemory.get(pc);
+      if (!memory) statsMemory.set(pc, (memory = new Map()));
+      // Per-second rate of a cumulative counter since the previous sample.
+      const perSecond = (key, value, ts) => {
+        const before = memory.get(key);
+        memory.set(key, { value, ts });
+        if (!before || before.value == null || value == null || ts == null || ts <= before.ts || value < before.value) {
+          return null;
+        }
+        return ((value - before.value) * 1000) / (ts - before.ts);
+      };
+      const kbps = (key, bytes, ts) => {
+        const r = perSecond(key, bytes, ts);
+        return r == null ? null : Math.round((r * 8) / 1000);
+      };
+
+      let hasOutboundVideo = false;
+      for (const s of stats.values()) {
+        const isVideo = s.kind === "video" || s.mediaType === "video";
+        if (s.type === "outbound-rtp" && isVideo) {
+          hasOutboundVideo = true;
+          const source = stats.get(s.mediaSourceId) || {};
+          const remote = [...stats.values()].find((r) => r.type === "remote-inbound-rtp" && r.localId === s.id) || {};
+          const encoder = s.encoderImplementation || null;
+          snap.sending.push({
+            id: s.id,
+            rid: s.rid || null,
+            screen: screenIds.has(source.trackIdentifier),
+            active: s.active !== false,
+            width: finite(s.frameWidth),
+            height: finite(s.frameHeight),
+            fps: finite(s.framesPerSecond),
+            sourceFps: finite(source.framesPerSecond),
+            sourceWidth: finite(source.width),
+            sourceHeight: finite(source.height),
+            kbps: kbps(`${s.id}:bytes`, (finite(s.bytesSent) ?? 0) + (finite(s.headerBytesSent) ?? 0), s.timestamp),
+            targetKbps: finite(s.targetBitrate) == null ? null : Math.round(s.targetBitrate / 1000),
+            limit: s.qualityLimitationReason || "none",
+            limitDurations: s.qualityLimitationDurations || null,
+            resolutionChanges: finite(s.qualityLimitationResolutionChanges),
+            encoder,
+            hardware: isHardwareCoder(encoder, s.powerEfficientEncoder),
+            codec: codecName(stats.get(s.codecId)?.mimeType),
+            layers: s.scalabilityMode || null,
+            lossPct: finite(remote.fractionLost) == null ? null : Math.round(remote.fractionLost * 1000) / 10,
+            rttMs: finite(remote.roundTripTime) == null ? null : Math.round(remote.roundTripTime * 1000),
+          });
+        } else if (s.type === "inbound-rtp" && isVideo) {
+          const received = finite(s.packetsReceived) ?? 0;
+          const lost = finite(s.packetsLost) ?? 0;
+          const recvRate = perSecond(`${s.id}:recv`, received, s.timestamp);
+          const lostRate = perSecond(`${s.id}:lost`, lost, s.timestamp);
+          const decoder = s.decoderImplementation || null;
+          const entry = {
+            id: s.id,
+            trackId: s.trackIdentifier || null,
+            width: finite(s.frameWidth),
+            height: finite(s.frameHeight),
+            fps: finite(s.framesPerSecond),
+            kbps: kbps(`${s.id}:bytes`, finite(s.bytesReceived), s.timestamp),
+            droppedPerSec: perSecond(`${s.id}:dropped`, finite(s.framesDropped), s.timestamp),
+            freezes: finite(s.freezeCount),
+            freezeSec: finite(s.totalFreezesDuration),
+            lossPct:
+              recvRate != null && lostRate != null && recvRate + lostRate > 0
+                ? Math.round((lostRate / (recvRate + lostRate)) * 1000) / 10
+                : null,
+            jitterMs: finite(s.jitter) == null ? null : Math.round(s.jitter * 1000),
+            decoder,
+            hardware: isHardwareCoder(decoder, s.powerEfficientDecoder),
+            codec: codecName(stats.get(s.codecId)?.mimeType),
+          };
+          if ((entry.fps ?? 0) > 0 || (entry.kbps ?? 0) > 0) snap.receiving.push(entry);
+        }
+      }
+
+      const transport = [...stats.values()].find((s) => s.type === "transport" && s.selectedCandidatePairId);
+      const pair =
+        stats.get(transport?.selectedCandidatePairId) ||
+        [...stats.values()].find((s) => s.type === "candidate-pair" && s.nominated && s.state === "succeeded");
+      if (pair) {
+        if (hasOutboundVideo && finite(pair.availableOutgoingBitrate) != null) {
+          snap.uplinkKbps = Math.round(pair.availableOutgoingBitrate / 1000);
+        }
+        if (finite(pair.currentRoundTripTime) != null && (hasOutboundVideo || snap.rttMs == null)) {
+          snap.rttMs = Math.round(pair.currentRoundTripTime * 1000);
+        }
+      }
+    }
+
+    // If Micup re-wrapped the captured track, the ids won't match: with a screen share running
+    // and one video going out, that video is the screen.
+    if (!snap.sending.some((l) => l.screen) && screenIds.size > 0) {
+      const sources = new Set(snap.sending.map((l) => l.sourceWidth + "x" + l.sourceHeight));
+      if (sources.size === 1) snap.sending.forEach((l) => (l.screen = true));
+    }
+    snap.sending.sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0));
+    snap.receiving.sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0));
+    snap.targetFps = screenShareTargetFps;
+    return snap;
+  }
+
+  // The layer viewers mostly get: the biggest active screen-share encoding.
+  const mainScreenLayer = (snap) => snap?.sending.find((l) => l.screen && l.active) || null;
+
+  const formatMbps = (kbps) => (kbps == null ? "—" : `${(kbps / 1000).toFixed(1).replace(".", ",")} Mbps`);
+  const formatRes = (w, h) => (w && h ? `${w}×${h}` : "—");
+  const formatFps = (fps) => (fps == null ? "—" : `${Math.round(fps)} FPS`);
+  const LIMIT_LABELS = { cpu: "processador", bandwidth: "internet", other: "outro motivo" };
+
+  // Plain-language reading of a sample, for the meter and the report.
+  function diagnoseStreamHealth(snap) {
+    const notes = [];
+    const layer = mainScreenLayer(snap);
+    if (layer) {
+      const target = snap.targetFps || null;
+      const fps = layer.fps ?? 0;
+      const low = target ? fps < target * 0.8 : false;
+      if (layer.limit === "cpu") {
+        notes.push({
+          level: "warn",
+          text:
+            "Seu PC não está dando conta de codificar o stream. A resolução é reduzida para segurar o FPS." +
+            (layer.hardware === false
+              ? ` O encoder é por software (${layer.encoder || layer.codec || "?"}): nas configurações de Voz e vídeo do Micup, prefira o codec H.264 ou a aceleração por hardware.`
+              : ""),
+        });
+      } else if (layer.limit === "bandwidth") {
+        notes.push({
+          level: "warn",
+          text: `Sua internet de upload está no limite (estimativa: ${formatMbps(snap.uplinkKbps)}). A resolução é reduzida para segurar o FPS.`,
+        });
+      }
+      if (target && layer.sourceFps != null && layer.sourceFps < target * 0.8) {
+        notes.push({
+          level: "warn",
+          text: `A captura está entregando só ${formatFps(layer.sourceFps)}. O que está sendo compartilhado não gera mais quadros que isso (jogo limitado, janela parada ou minimizada).`,
+        });
+      } else if (low && layer.limit === "none") {
+        notes.push({ level: "warn", text: `O stream está saindo a ${formatFps(fps)} (escolhido: ${target} FPS).` });
+      }
+      if (layer.layers && /^L1T[23]/.test(layer.layers)) {
+        notes.push({
+          level: "info",
+          text: `Camadas de FPS ativas (${layer.layers}): quem tiver o download mais fraco recebe 30 ou 15 FPS em vez de travar.`,
+        });
+      }
+      if (notes.every((n) => n.level !== "warn")) {
+        notes.unshift({ level: "ok", text: `Transmitindo liso: ${formatFps(fps)} em ${formatRes(layer.width, layer.height)}.` });
+      }
+    }
+    const watching = snap?.receiving[0];
+    if (watching) {
+      const dropping = (watching.droppedPerSec ?? 0) >= 3;
+      if (dropping) {
+        notes.push({
+          level: "warn",
+          text:
+            `O vídeo que você assiste está perdendo ${Math.round(watching.droppedPerSec)} quadros/s na decodificação.` +
+            (watching.hardware === false ? ` O decodificador é por software (${watching.decoder || watching.codec}).` : ""),
+        });
+      }
+      if ((watching.lossPct ?? 0) >= 2) {
+        notes.push({ level: "warn", text: `Sua internet está perdendo ${watching.lossPct}% dos pacotes do vídeo que você assiste.` });
+      }
+    }
+    return notes;
+  }
+
+  // Sampling loop: runs while a screen share is live or something is watching (meter, overlay).
+  const streamHealth = {
+    last: null,
+    history: [], // compact samples for the copied report
+    listeners: new Set(),
+    timer: null,
+    lowStreak: 0,
+    limitedSince: null,
+    lastEventAt: {},
+  };
+
+  function streamHealthWanted() {
+    return (
+      streamHealth.listeners.size > 0 ||
+      liveScreenShareTracks().length > 0 ||
+      !!state?.settings?.plugins?.ScreenShareBypass?.showStatsOverlay
+    );
+  }
+
+  function recordThrottled(type, data, everyMs) {
+    const now = Date.now();
+    if (now - (streamHealth.lastEventAt[type] || 0) < everyMs) return;
+    streamHealth.lastEventAt[type] = now;
+    recordScreenShareEvent(type, data);
+  }
+
+  // Turn sustained problems into entries of the screen-share log, so a friend's "it dropped to
+  // 30" can be matched to a cause afterwards.
+  function watchForTrouble(snap) {
+    const layer = mainScreenLayer(snap);
+    const target = snap.targetFps;
+    if (!layer || !target || layer.fps == null) {
+      streamHealth.lowStreak = 0;
+      return;
+    }
+    const low = layer.fps < target * 0.8;
+    streamHealth.lowStreak = low ? streamHealth.lowStreak + 1 : 0;
+    const details = {
+      fps: Math.round(layer.fps),
+      target,
+      sourceFps: layer.sourceFps == null ? null : Math.round(layer.sourceFps),
+      resolution: formatRes(layer.width, layer.height),
+      limit: layer.limit,
+      kbps: layer.kbps,
+      uplinkKbps: snap.uplinkKbps,
+      encoder: layer.encoder,
+    };
+    if (streamHealth.lowStreak === 3) recordThrottled("fps-low", details, 30000);
+    if (layer.limit !== "none") {
+      if (!streamHealth.limitedSince) streamHealth.limitedSince = snap.at;
+      else if (snap.at - streamHealth.limitedSince >= 6000) recordThrottled("stream-limited", details, 60000);
+    } else {
+      streamHealth.limitedSince = null;
+    }
+  }
+
+  async function streamHealthTick() {
+    streamHealth.timer = null;
+    if (!streamHealthWanted()) {
+      renderStatsOverlay(null);
+      return;
+    }
+    try {
+      const snap = await collectStreamHealth();
+      streamHealth.last = snap;
+      const layer = mainScreenLayer(snap);
+      const watching = snap.receiving[0];
+      streamHealth.history.push({
+        t: snap.at,
+        out: layer && [Math.round(layer.fps ?? 0), layer.width, layer.height, layer.kbps, layer.limit, layer.sourceFps == null ? null : Math.round(layer.sourceFps)],
+        in: watching && [Math.round(watching.fps ?? 0), watching.width, watching.height, watching.kbps],
+        up: snap.uplinkKbps,
+      });
+      if (streamHealth.history.length > 150) streamHealth.history.splice(0, streamHealth.history.length - 150);
+      watchForTrouble(snap);
+      renderStatsOverlay(snap);
+      for (const fn of streamHealth.listeners) {
+        try {
+          fn(snap);
+        } catch {}
+      }
+    } catch (e) {
+      Logger.warn("Falha ao ler as estatísticas do stream:", e);
+    }
+    scheduleStreamHealth();
+  }
+
+  function scheduleStreamHealth(delay = 2000) {
+    if (streamHealth.timer || !streamHealthWanted()) return;
+    streamHealth.timer = setTimeout(streamHealthTick, delay);
+  }
+
+  function subscribeStreamHealth(fn) {
+    streamHealth.listeners.add(fn);
+    if (streamHealth.last) fn(streamHealth.last);
+    if (streamHealth.timer) {
+      clearTimeout(streamHealth.timer);
+      streamHealth.timer = null;
+    }
+    scheduleStreamHealth(0);
+    return () => streamHealth.listeners.delete(fn);
+  }
+
+  function streamHealthReport() {
+    return {
+      version: VERSION,
+      at: new Date().toISOString(),
+      last: streamHealth.last,
+      diagnosis: streamHealth.last ? diagnoseStreamHealth(streamHealth.last).map((n) => n.text) : [],
+      // [fps, width, height, kbps, limit, sourceFps] sent / [fps, width, height, kbps] watched
+      history: streamHealth.history.slice(-90),
+      events: readScreenShareEvents().slice(0, 25),
+    };
+  }
+
+  // Small always-on-top meter (ScreenShare Plus → "Medidor na tela").
+  let statsOverlayEl = null;
+  function renderStatsOverlay(snap) {
+    const enabled = !!state?.settings?.plugins?.ScreenShareBypass?.enabled && !!state?.settings?.plugins?.ScreenShareBypass?.showStatsOverlay;
+    const layer = enabled && snap ? mainScreenLayer(snap) : null;
+    const watching = enabled && snap ? snap.receiving[0] : null;
+    if (!layer && !watching) {
+      statsOverlayEl?.remove();
+      statsOverlayEl = null;
+      return;
+    }
+    if (!statsOverlayEl || !statsOverlayEl.isConnected) {
+      statsOverlayEl = document.createElement("div");
+      statsOverlayEl.className = "bmu-stats-overlay";
+      document.body.appendChild(statsOverlayEl);
+    }
+    const rows = [];
+    if (layer) {
+      const warn = layer.limit !== "none" || (snap.targetFps && (layer.fps ?? 0) < snap.targetFps * 0.8);
+      rows.push(
+        `<div class="bmu-stats-row${warn ? " is-warn" : ""}"><b>▲ ${formatFps(layer.fps)}</b><span>${formatRes(layer.width, layer.height)} · ${formatMbps(layer.kbps)}${
+          layer.limit !== "none" ? ` · limite: ${LIMIT_LABELS[layer.limit] || layer.limit}` : ""
+        }</span></div>`
+      );
+    }
+    if (watching) {
+      const warn = (watching.droppedPerSec ?? 0) >= 3 || (watching.lossPct ?? 0) >= 2;
+      rows.push(
+        `<div class="bmu-stats-row${warn ? " is-warn" : ""}"><b>▼ ${formatFps(watching.fps)}</b><span>${formatRes(watching.width, watching.height)} · ${formatMbps(watching.kbps)}</span></div>`
+      );
+    }
+    statsOverlayEl.innerHTML = rows.join("");
   }
 
   // Micup's preload exposes `window.electron.toggleDevTools()` (older builds: window.flx).
@@ -171,7 +571,11 @@
   // ==========================================================================
   // 1. Persistent Configuration & State Management
   // ==========================================================================
+  // Bump when a saved setting needs migrating (see loadSettings).
+  const SETTINGS_REVISION = 2;
+
   const DEFAULT_SETTINGS = {
+    settingsRevision: SETTINGS_REVISION,
     activeTheme: "obsidian",
     quickCssEnabled: true,
     quickCss: `/* Better MicUP QuickCSS — Mac Obsidian Style */\n`,
@@ -182,8 +586,11 @@
         enabled: true,
         forceResolution: "picker",
         forceFps: "picker",
-        maxBitrateKbps: "12000",
-        disableEncoderThrottling: true,
+        // "smooth": keep the frame rate, lower the resolution under pressure.
+        // "sharp": keep the resolution, let the frame rate drop. "micup": Micup's own adaptation.
+        priority: "smooth",
+        maxBitrateKbps: "auto",
+        showStatsOverlay: false,
         unlockCamera1080p: true,
       },
       MessageLogger: {
@@ -243,10 +650,25 @@
           merged.plugins[k] = { ...DEFAULT_SETTINGS.plugins[k] };
         }
       }
+      migrateSettings(parsed, merged);
       return merged;
     } catch {
       return structuredClone(DEFAULT_SETTINGS);
     }
+  }
+
+  function migrateSettings(saved, merged) {
+    const revision = Number(saved.settingsRevision) || 1;
+    const ss = merged.plugins.ScreenShareBypass;
+    if (ss && revision < 2) {
+      // 1.0.4 and older forced "maintain-resolution" (FPS dropped to 30/15 under load) and a
+      // 12 Mbps floor (viewers with weaker downloads got only part of the frames).
+      if (saved.plugins?.ScreenShareBypass?.disableEncoderThrottling === false) ss.priority = "micup";
+      else ss.priority = "smooth";
+      if (ss.maxBitrateKbps === "12000") ss.maxBitrateKbps = "auto";
+    }
+    if (ss) delete ss.disableEncoderThrottling;
+    merged.settingsRevision = SETTINGS_REVISION;
   }
 
   function loadMessageLogs() {
@@ -277,6 +699,8 @@
     }
     applyThemesAndQuickCSS();
     notifyUI();
+    renderStatsOverlay(streamHealth.last); // hides the meter right away when it was turned off
+    scheduleStreamHealth(0);
   }
 
   function saveMessageLogs() {
@@ -945,26 +1369,54 @@
       name: "ScreenShare Plus",
       category: "Voz e vídeo",
       author: "Better MicUP",
-      description: "Libera as resoluções e taxas de quadros do Plus no compartilhamento de tela e aumenta o bitrate.",
+      description: "Libera as resoluções e taxas de quadros do Plus no compartilhamento de tela e segura o FPS escolhido.",
       settingsSchema: [
+        {
+          key: "priority",
+          label: "Quando a internet ou o PC apertarem",
+          type: "select",
+          options: [
+            {
+              value: "smooth",
+              label: "Manter a fluidez",
+              description: "Recomendado. Segura o FPS escolhido e reduz a resolução só enquanto faltar fôlego.",
+            },
+            {
+              value: "sharp",
+              label: "Manter a nitidez",
+              description: "Segura a resolução e deixa o FPS cair. Melhor para texto e código parados.",
+            },
+            {
+              value: "micup",
+              label: "Deixar com o Micup",
+              description: "Adaptação original do Micup, que baixa para 30 FPS quando a conexão aperta.",
+            },
+          ],
+        },
         {
           key: "maxBitrateKbps",
           label: "Bitrate máximo",
           type: "select",
           options: [
-            { value: "6000", label: "6 Mbps", description: "Igual ao Plus." },
+            {
+              value: "auto",
+              label: "Automático",
+              description: "Recomendado. Calcula pela resolução, FPS e codec. Mais leve para quem assiste.",
+            },
+            { value: "6000", label: "6 Mbps" },
             { value: "9000", label: "9 Mbps" },
-            { value: "12000", label: "12 Mbps", description: "Recomendado." },
+            { value: "12000", label: "12 Mbps" },
             { value: "15000", label: "15 Mbps" },
-            { value: "20000", label: "20 Mbps", description: "Só para internet boa de upload." },
+            { value: "20000", label: "20 Mbps", description: "Quem assiste com internet mais fraca pode receber menos FPS." },
           ],
         },
         {
-          key: "disableEncoderThrottling",
-          label: "Manter resolução e FPS fixos",
-          description: "Desliga a adaptação automática do Micup. Mais nitidez, mas o stream pode engasgar em internet ou PC mais fracos.",
+          key: "showStatsOverlay",
+          label: "Medidor na tela",
+          description: "Mostra no canto da tela o FPS, a resolução e o bitrate do que você transmite e do que você assiste.",
           type: "boolean",
         },
+        { key: "streamHealth", label: "Agora", type: "health" },
       ],
     },
     {
@@ -1109,8 +1561,7 @@
       // 2. Camera 1080p unlock via VoiceSettings
       const ssCfg = state.settings.plugins.ScreenShareBypass;
       if (ssCfg?.enabled) {
-        const voiceSettingsMod = Webpack.getModule(844865);
-        const voiceSettings = voiceSettingsMod?.Ay || voiceSettingsMod?.default;
+        const voiceSettings = pickVoiceSettingsStore(Webpack.getModule(844865));
         const voiceActionsMod = Webpack.getModule(494382);
         const updateFn =
           typeof voiceActionsMod?.yo === "function"
@@ -1691,10 +2142,12 @@
 
     // Sync store-based plugins once key stores load
     for (const storeId of [525564, 823063, 978111, 844865, 685161, 618349, 468258]) {
-      Webpack.onModule(storeId, () => syncStoreBasedPlugins());
+      // Deferred: the store may load inside a require cycle, before its neighbours finish.
+      Webpack.onModule(storeId, () => setTimeout(syncStoreBasedPlugins, 0));
     }
     setTimeout(syncStoreBasedPlugins, 1800);
     setTimeout(syncStoreBasedPlugins, 8000); // stores found by shape may finish loading later
+    scheduleStreamHealth(4000); // starts only if the on-screen meter is turned on
 
     // ------------------------------------------------------------------------
     // E. ScreenSharePlusBypass Hooks (`690261`, `477986`, `702223`, `857720`, `414298`)
@@ -1787,6 +2240,50 @@
       source: { width: 3840, height: 2160 },
     };
 
+    // What to give up when the encoder or the uplink can't keep up.
+    // WebRTC's "maintain-framerate" lowers the resolution for a moment and keeps every frame;
+    // "maintain-resolution" (what 1.0.4 forced) drops frames instead, so viewers saw 30/15 FPS.
+    const ssPriority = (cfg) => (cfg?.priority === "sharp" || cfg?.priority === "micup" ? cfg.priority : "smooth");
+    const ssTakesOver = (cfg) => !!cfg?.enabled && ssPriority(cfg) !== "micup";
+    const ssDegradation = (cfg) => (ssPriority(cfg) === "sharp" ? "maintain-resolution" : "maintain-framerate");
+
+    // Bitrate ceiling (H.264, 60 FPS). Enough for games without starving the viewers: the SFU
+    // forwards only part of the frames (30 or 15 FPS with VP9/AV1 temporal layers) to anyone
+    // whose download can't take the whole stream, so a needlessly high bitrate costs them FPS.
+    const AUTO_BITRATE_KBPS = { low_240p: 1500, low_480p: 2500, medium: 5000, high: 8000, ultra: 12000, source: 16000 };
+    const codecFromMime = codecName;
+    const autoScreenShareBitrate = (resolution, frameRate, codec) => {
+      const base = AUTO_BITRATE_KBPS[resolution] || AUTO_BITRATE_KBPS.high;
+      const fps = Number(frameRate) || 60;
+      const fpsFactor = fps >= 120 ? 1.6 : fps >= 90 ? 1.35 : fps >= 60 ? 1 : fps >= 30 ? 0.65 : 0.4;
+      const c = codecFromMime(codec);
+      const codecFactor = c === "av1" ? 0.7 : c === "vp9" || c === "h265" ? 0.8 : 1;
+      return Math.round(base * fpsFactor * codecFactor) * 1000;
+    };
+    // Codec of the current share, learned from Micup's publish options and the sender.
+    let currentScreenShareCodec = null;
+    const noteScreenShareCodec = (codec) => {
+      const c = codecFromMime(codec);
+      if (c) currentScreenShareCodec = c;
+    };
+    // `micupBps` is what Micup picked; "auto" never goes below it, a fixed choice is exact.
+    function resolveScreenShareBitrate(cfg, micupBps, resolution, frameRate, codec) {
+      const fixed = Number(cfg?.maxBitrateKbps);
+      if (cfg?.maxBitrateKbps !== "auto" && fixed > 0) return fixed * 1000;
+      const auto = autoScreenShareBitrate(resolution, frameRate, codec || currentScreenShareCodec);
+      return Math.max(Number(micupBps) || 0, auto);
+    }
+    // Encode at most the chosen resolution even if the capture came bigger (e.g. a 4K monitor
+    // when applyConstraints was refused). Same short-side rule Micup uses.
+    const scaleCaptureToTarget = (capture, width, height) => {
+      const cw = Number(capture?.width);
+      const ch = Number(capture?.height);
+      const tw = Number(width);
+      const th = Number(height);
+      if (!(cw > 0 && ch > 0 && tw > 0 && th > 0)) return 1;
+      return Math.max(1, Math.min(cw, ch) / Math.min(tw, th));
+    };
+
     const getDesiredScreenShareSpec = (fallbackRes = "high", fallbackFps = 60) => {
       const cfg = state.settings.plugins.ScreenShareBypass;
       const mode = voiceSettingsStore?.streamingMode || "custom";
@@ -1810,7 +2307,7 @@
       }
 
       const dims = RES_DIMENSIONS[resolution] || RES_DIMENSIONS.high;
-      const maxBitrate = Math.max(6000000, (Number(cfg?.maxBitrateKbps) || 12000) * 1000);
+      const maxBitrate = resolveScreenShareBitrate(cfg, 0, resolution, frameRate);
       return {
         mode:
           (cfg?.forceResolution && cfg.forceResolution !== "picker") ||
@@ -1875,6 +2372,7 @@
           try {
             settings = track.getSettings?.() || {};
           } catch {}
+          noteScreenShareTrack(track);
           recordScreenShareEvent("capture-started", {
             surface: settings.displaySurface || null,
             width: settings.width || null,
@@ -1968,8 +2466,7 @@
         const patchedSetParameters = function (params) {
           const cfg = state.settings.plugins.ScreenShareBypass;
           if (
-            cfg?.enabled &&
-            cfg.disableEncoderThrottling &&
+            ssTakesOver(cfg) &&
             params &&
             typeof params === "object" &&
             this?.track?.kind === "video" &&
@@ -1978,18 +2475,27 @@
               params.degradationPreference === "maintain-framerate-and-resolution")
           ) {
             const spec = getDesiredScreenShareSpec();
+            const codec = codecFromMime(params.codecs?.[0]?.mimeType);
+            noteScreenShareCodec(codec);
+            screenShareTargetFps = spec.frameRate;
+            let capture = null;
+            try {
+              capture = this.track.getSettings?.() || null;
+            } catch {}
+            const scale =
+              spec.resolution === "source" ? 1 : scaleCaptureToTarget(capture, spec.width, spec.height);
             // Build a copy instead of mutating Micup's object, so we can fall back to it.
-            const boosted = { ...params, degradationPreference: "maintain-resolution" };
+            const boosted = { ...params, degradationPreference: ssDegradation(cfg) };
             if (Array.isArray(params.encodings)) {
               boosted.encodings = params.encodings.map((enc) => {
                 const next = {
                   ...enc,
                   active: true,
                   maxFramerate: spec.frameRate,
-                  maxBitrate: Math.max(Number(enc.maxBitrate || 0), spec.maxBitrate),
+                  maxBitrate: resolveScreenShareBitrate(cfg, enc.maxBitrate, spec.resolution, spec.frameRate, codec),
                   priority: "high",
                   networkPriority: "high",
-                  scaleResolutionDownBy: 1,
+                  scaleResolutionDownBy: scale,
                 };
                 delete next.scaleResolutionDownTo;
                 return next;
@@ -2019,7 +2525,7 @@
 
     // Track `VoiceSettings` store (`844865`) so we always know the selected resolution & FPS
     Webpack.onModule(844865, (exports) => {
-      const store = exports?.Ay || exports?.default;
+      const store = pickVoiceSettingsStore(exports);
       if (!store || store.__miccordPatched) return;
       store.__miccordPatched = true;
       voiceSettingsStore = store;
@@ -2110,7 +2616,7 @@
         "Fd",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling && args[0]?.frameRate) {
+          if (ssTakesOver(cfg) && args[0]?.frameRate) {
             return args[0].frameRate;
           }
           return orig(...args);
@@ -2124,7 +2630,7 @@
         "bA",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling) {
+          if (ssTakesOver(cfg)) {
             return { capped: false, narrowRounds: 0, recoveredRounds: 0, drops: 0 };
           }
           return orig(...args);
@@ -2138,7 +2644,7 @@
         "wU",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling && args[0]?.width && args[0]?.height) {
+          if (ssTakesOver(cfg) && args[0]?.width && args[0]?.height) {
             return [{ width: args[0].width, height: args[0].height }];
           }
           return orig(...args);
@@ -2153,7 +2659,7 @@
           ladderFn,
           (args, orig) => {
             const cfg = state.settings.plugins.ScreenShareBypass;
-            if (cfg?.enabled && cfg.disableEncoderThrottling) {
+            if (ssTakesOver(cfg)) {
               return { index: 0, downRounds: 0, upRounds: 0, drops: 0, lastStepUp: false };
             }
             return orig(...args);
@@ -2162,14 +2668,14 @@
         );
       }
 
-      // `B$(options)` -> Degradation preference resolver (use "maintain-resolution" to disable JS ladder & WebRTC downscaling)
+      // `B$(options)` -> Degradation preference resolver (our priority instead of Micup's JS ladder)
       Patcher.instead(
         exports,
         "B$",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling) {
-            return "maintain-resolution";
+          if (ssTakesOver(cfg)) {
+            return ssDegradation(cfg);
           }
           return orig(...args);
         },
@@ -2182,7 +2688,7 @@
         "ru",
         (args) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling && args[0] && typeof args[0] === "object") {
+          if (ssTakesOver(cfg) && args[0] && typeof args[0] === "object") {
             args[0] = {
               ...args[0],
               frameRateCapped: false,
@@ -2200,7 +2706,7 @@
         "ru",
         (args, res) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (!cfg?.enabled || !cfg.disableEncoderThrottling || !res || typeof res !== "object") {
+          if (!ssTakesOver(cfg) || !res || typeof res !== "object") {
             return res;
           }
           const target = args[0]?.target;
@@ -2209,12 +2715,15 @@
             cfg.forceFps && cfg.forceFps !== "picker"
               ? Number(cfg.forceFps)
               : Number(target?.frameRate || spec.frameRate || 60);
-          const wantedBitrate = Math.max(
-            Number(target?.maxBitrate || 6000000),
-            spec.maxBitrate
+          const wantedBitrate = resolveScreenShareBitrate(
+            cfg,
+            target?.maxBitrate,
+            target?.resolution || spec.resolution,
+            wantedFps
           );
+          const scale = scaleCaptureToTarget(args[0]?.capture, target?.width, target?.height);
 
-          res.degradationPreference = "maintain-resolution";
+          res.degradationPreference = ssDegradation(cfg);
           if (Array.isArray(res.encodings)) {
             res.encodings = res.encodings.map((enc) => {
               const updated = {
@@ -2224,7 +2733,7 @@
                 maxBitrate: wantedBitrate,
                 priority: "high",
                 networkPriority: "high",
-                scaleResolutionDownBy: 1,
+                scaleResolutionDownBy: scale,
               };
               delete updated.scaleResolutionDownTo;
               return updated;
@@ -2305,6 +2814,7 @@
         (args) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
           if (cfg?.enabled && args[0] && typeof args[0] === "object") {
+            noteScreenShareCodec(args[0].codec);
             args[0] = {
               ...args[0],
               entitled: true,
@@ -2347,7 +2857,6 @@
             cfg.forceFps && cfg.forceFps !== "picker"
               ? snapFrameRate(cfg.forceFps)
               : snapFrameRate(input.storedFrameRate || res.frameRate || 60);
-          const minBitrate = (Number(cfg.maxBitrateKbps) || 12000) * 1000;
 
           if (isCustomOrForcedRes && RES_DIMENSIONS[wantedRes]) {
             res.resolution = wantedRes;
@@ -2374,11 +2883,11 @@
             res.contentHint = "motion";
           }
 
-          res.maxBitrate = Math.max(res.maxBitrate || 6000000, minBitrate);
+          res.maxBitrate = resolveScreenShareBitrate(cfg, res.maxBitrate, res.resolution, res.frameRate, input.codec);
           res.tierLimited = false;
           res.softwareEncoderClamped = false;
-          if (cfg.disableEncoderThrottling) {
-            res.degradationPreference = "maintain-resolution";
+          if (ssTakesOver(cfg)) {
+            res.degradationPreference = ssDegradation(cfg);
           }
           return res;
         },
@@ -2397,7 +2906,6 @@
             cfg.forceFps && cfg.forceFps !== "picker"
               ? snapFrameRate(cfg.forceFps)
               : snapFrameRate(args[0]?.frameRate || res.captureOptions?.resolution?.frameRate || 60);
-          const minBitrate = (Number(cfg.maxBitrateKbps) || 12000) * 1000;
 
           if (res.captureOptions?.resolution) {
             res.captureOptions.resolution.frameRate = wantedFps;
@@ -2414,14 +2922,16 @@
           }
           if (res.publishOptions?.screenShareEncoding) {
             res.publishOptions.screenShareEncoding.maxFramerate = wantedFps;
-            res.publishOptions.screenShareEncoding.maxBitrate = Math.max(
-              res.publishOptions.screenShareEncoding.maxBitrate || 6000000,
-              minBitrate
+            res.publishOptions.screenShareEncoding.maxBitrate = resolveScreenShareBitrate(
+              cfg,
+              res.publishOptions.screenShareEncoding.maxBitrate,
+              args[0]?.resolution,
+              wantedFps
             );
             res.publishOptions.screenShareEncoding.priority = "high";
           }
-          if (cfg.disableEncoderThrottling && res.publishOptions) {
-            res.publishOptions.degradationPreference = "maintain-resolution";
+          if (ssTakesOver(cfg) && res.publishOptions) {
+            res.publishOptions.degradationPreference = ssDegradation(cfg);
           }
           return res;
         },
@@ -2544,7 +3054,7 @@
         "isSoftwareEncoderClamped",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling) return false;
+          if (ssTakesOver(cfg)) return false;
           return orig(...args);
         },
         "ScreenShareBypass_NoSoftClamp"
@@ -2555,7 +3065,7 @@
         "isFrameRateCapped",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling) return false;
+          if (ssTakesOver(cfg)) return false;
           return orig(...args);
         },
         "ScreenShareBypass_NoFpsCap"
@@ -2566,7 +3076,7 @@
         "setFrameRateCapped",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling) {
+          if (ssTakesOver(cfg)) {
             targetStore.frameRateCapped = false;
             return;
           }
@@ -2580,7 +3090,7 @@
         "getLadderRung",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling) return null;
+          if (ssTakesOver(cfg)) return null;
           return orig(...args);
         },
         "ScreenShareBypass_NoLadderRung"
@@ -2591,7 +3101,7 @@
         "setLadderRung",
         (args, orig) => {
           const cfg = state.settings.plugins.ScreenShareBypass;
-          if (cfg?.enabled && cfg.disableEncoderThrottling) {
+          if (ssTakesOver(cfg)) {
             targetStore.ladderRung = null;
             return;
           }
@@ -2616,12 +3126,13 @@
             if (!cfg?.enabled || !res || typeof res !== "object") return res;
             const spec = getDesiredScreenShareSpec(res.resolution, res.frameRate);
             res.frameRate = spec.frameRate;
-            res.maxBitrate = Math.max(res.maxBitrate || 6000000, spec.maxBitrate);
+            screenShareTargetFps = spec.frameRate;
+            res.maxBitrate = resolveScreenShareBitrate(cfg, res.maxBitrate, res.resolution, spec.frameRate);
             if (spec.frameRate >= 60) {
               res.contentHint = "motion";
             }
-            if (cfg.disableEncoderThrottling) {
-              res.degradationPreference = "maintain-resolution";
+            if (ssTakesOver(cfg)) {
+              res.degradationPreference = ssDegradation(cfg);
               res.softwareEncoderClamped = false;
             }
             return res;
@@ -2643,17 +3154,21 @@
             return resPromise.then((res) => {
               if (!res || typeof res !== "object") return res;
               const spec = getDesiredScreenShareSpec();
+              noteScreenShareCodec(res.videoCodec);
               res.screenShareEncoding = {
                 ...(res.screenShareEncoding || {}),
-                maxBitrate: Math.max(
-                  Number(res.screenShareEncoding?.maxBitrate || 0),
-                  spec.maxBitrate
+                maxBitrate: resolveScreenShareBitrate(
+                  cfg,
+                  res.screenShareEncoding?.maxBitrate,
+                  spec.resolution,
+                  spec.frameRate,
+                  res.videoCodec
                 ),
                 maxFramerate: spec.frameRate,
                 priority: "high",
               };
-              if (cfg.disableEncoderThrottling) {
-                res.degradationPreference = "maintain-resolution";
+              if (ssTakesOver(cfg)) {
+                res.degradationPreference = ssDegradation(cfg);
                 res.simulcast = false;
                 delete res.screenShareSimulcastLayers;
                 if (spec.frameRate > 60) {
@@ -2661,6 +3176,14 @@
                   delete res.backupCodecPolicy;
                 }
               }
+              recordScreenShareEvent("publish-settings", {
+                codec: res.videoCodec || null,
+                layers: res.scalabilityMode || (res.simulcast ? "simulcast" : null),
+                fps: spec.frameRate,
+                resolution: spec.resolution,
+                maxKbps: Math.round(res.screenShareEncoding.maxBitrate / 1000),
+                priority: ssPriority(cfg),
+              });
               return res;
             });
           },
@@ -3395,6 +3918,14 @@
         h(TextInput, { value: cfg[field.key], onChange: set, placeholder: field.placeholder })
       );
     }
+    if (field.type === "health") {
+      return h(
+        "div",
+        { className: "bmu-field" },
+        h("div", { className: "bmu-field-label" }, field.label),
+        h(StreamHealthPanel)
+      );
+    }
     return null;
   }
 
@@ -3681,7 +4212,110 @@
     "encoder-stall-reported": "Micup achou que o encoder travou",
     "encoder-stall-false-alarm": "Alarme falso do encoder (stream mantido)",
     "encoder-stall-confirmed": "Encoder travou de verdade",
+    "publish-settings": "Stream configurado",
+    "fps-low": "FPS do stream caiu",
+    "stream-limited": "Stream limitado",
   };
+
+  function screenEventDetails(ev) {
+    if (ev.type === "publish-settings") {
+      return [
+        ev.codec && String(ev.codec).toUpperCase(),
+        ev.fps && `${ev.fps} FPS`,
+        ev.maxKbps && `até ${formatMbps(ev.maxKbps)}`,
+        ev.layers,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+    if (ev.type === "fps-low" || ev.type === "stream-limited") {
+      return [
+        ev.fps != null && `${ev.fps}${ev.target ? `/${ev.target}` : ""} FPS`,
+        ev.resolution,
+        ev.limit && ev.limit !== "none" && `limite: ${LIMIT_LABELS[ev.limit] || ev.limit}`,
+        ev.sourceFps != null && ev.target && ev.sourceFps < ev.target * 0.8 && `captura: ${ev.sourceFps} FPS`,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+    if (ev.surface) return ev.surface === "window" ? "janela" : ev.surface;
+    return "";
+  }
+
+  // Live numbers of what you send and watch (Desenvolvedor page and ScreenShare Plus options).
+  function StreamHealthPanel() {
+    const React = getReact();
+    const [snap, setSnap] = React.useState(streamHealth.last);
+    React.useEffect(() => subscribeStreamHealth(setSnap), []);
+    const layer = snap ? mainScreenLayer(snap) : null;
+    const watching = snap?.receiving?.[0] || null;
+    const notes = snap ? diagnoseStreamHealth(snap) : [];
+    const stat = (label, value, warn) =>
+      h("div", { className: "bmu-stat" + (warn ? " is-warn" : "") }, h("span", null, label), h("b", null, value));
+    const coder = (entry) =>
+      `${(entry.codec || "?").toUpperCase()} · ${entry.hardware === false ? "software" : entry.hardware ? "placa de vídeo" : "?"}`;
+
+    return h(
+      "div",
+      { className: "bmu-health" },
+      !layer &&
+        !watching &&
+        h("div", { className: "bmu-empty" }, "Nenhum vídeo passando agora. Compartilhe a tela ou assista alguém para ver os números."),
+      layer &&
+        h(
+          "div",
+          { className: "bmu-health-block" },
+          h("div", { className: "bmu-health-title" }, "Você transmitindo"),
+          h(
+            "div",
+            { className: "bmu-stat-grid" },
+            stat(
+              "FPS",
+              formatFps(layer.fps) + (snap.targetFps ? ` de ${snap.targetFps}` : ""),
+              snap.targetFps && (layer.fps ?? 0) < snap.targetFps * 0.8
+            ),
+            stat("Resolução", formatRes(layer.width, layer.height)),
+            stat("Bitrate", formatMbps(layer.kbps)),
+            stat("Upload estimado", formatMbps(snap.uplinkKbps)),
+            stat(
+              "Captura",
+              formatFps(layer.sourceFps),
+              snap.targetFps && layer.sourceFps != null && layer.sourceFps < snap.targetFps * 0.8
+            ),
+            stat("Encoder", coder(layer), layer.hardware === false),
+            stat("Limitado por", layer.limit === "none" ? "nada" : LIMIT_LABELS[layer.limit] || layer.limit, layer.limit !== "none"),
+            stat("Ping", snap.rttMs == null ? "—" : `${snap.rttMs} ms`)
+          )
+        ),
+      watching &&
+        h(
+          "div",
+          { className: "bmu-health-block" },
+          h("div", { className: "bmu-health-title" }, "Você assistindo"),
+          h(
+            "div",
+            { className: "bmu-stat-grid" },
+            stat("FPS", formatFps(watching.fps)),
+            stat("Resolução", formatRes(watching.width, watching.height)),
+            stat("Bitrate", formatMbps(watching.kbps)),
+            stat("Quadros perdidos", `${Math.round(watching.droppedPerSec ?? 0)}/s`, (watching.droppedPerSec ?? 0) >= 3),
+            stat("Perda de pacotes", watching.lossPct == null ? "—" : `${watching.lossPct}%`, (watching.lossPct ?? 0) >= 2),
+            stat("Decoder", coder(watching), watching.hardware === false)
+          )
+        ),
+      notes.length > 0 &&
+        h(
+          "ul",
+          { className: "bmu-health-notes" },
+          notes.map((n, i) => h("li", { key: i, className: "is-" + n.level }, n.text))
+        )
+    );
+  }
+
+  function copyStreamHealthReport() {
+    navigator.clipboard?.writeText(JSON.stringify(streamHealthReport(), null, 2));
+    showToast("Relatório do stream copiado.", "success");
+  }
 
   function DeveloperPage() {
     const React = getReact();
@@ -3726,6 +4360,16 @@
       h(
         Section,
         {
+          title: "Saúde da transmissão",
+          description: "Números ao vivo do que você transmite e do que você assiste. Se alguém reclamar de travada, copie o relatório logo depois.",
+          actions: h(Button, { onClick: copyStreamHealthReport }, "Copiar relatório"),
+        },
+        h(StreamHealthPanel)
+      ),
+      h(Divider),
+      h(
+        Section,
+        {
           title: "Diagnóstico do compartilhamento de tela",
           description: "Os últimos eventos de compartilhamento, para entender por que um stream caiu.",
           actions:
@@ -3752,7 +4396,7 @@
                   { key: i, className: "bmu-event" },
                   h("time", null, new Date(ev.at).toLocaleString([], { dateStyle: "short", timeStyle: "medium" })),
                   h("span", null, SCREEN_EVENT_LABELS[ev.type] || ev.type),
-                  ev.surface && h("span", { className: "bmu-muted" }, ev.surface === "window" ? "janela" : ev.surface)
+                  screenEventDetails(ev) && h("span", { className: "bmu-muted" }, screenEventDetails(ev))
                 )
               )
             )
@@ -4224,6 +4868,9 @@
     get recentErrors() {
       return recentErrors.slice();
     },
+    // Números ao vivo do stream (o mesmo relatório do botão "Copiar relatório")
+    streamHealth: streamHealthReport,
+    collectStreamHealth,
     inspectCallView,
     saveSettings,
     showToast,
