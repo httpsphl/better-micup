@@ -25,6 +25,15 @@
 # sha256, then swaps the new files in and re-patches Micup. Turn it off with
 # update-config.json: { "autoUpdate": false }.
 #
+# v4 (2026-11-17): Micup shell 1.0.20+ installs a renderer update and reloads its
+# window in place, seconds before the new folder can be patched, so that session
+# ran without the mod until Micup was reopened. The guard now notices a Micup
+# session that started before the mod was applied to the renderer it shows, and:
+#  - right after an in-place update, reopens Micup by itself (the update had just
+#    reloaded the window anyway);
+#  - otherwise shows a notification asking to reopen Micup.
+# Turn the automatic reopen off with update-config.json: { "autoRestartMicup": false }.
+#
 # Usage:
 #   guard.ps1              run in background (started by guard.vbs at logon)
 #   guard.ps1 -CheckOnly   patch once and exit
@@ -329,6 +338,153 @@ function Invoke-PatchAll {
 }
 
 # ------------------------------------------------------------------------------
+# Micup sessions that started before the mod was applied (in-place updates)
+# ------------------------------------------------------------------------------
+$global:noticeIcon = $null
+$global:noticeUntil = $null
+$global:noticedSessions = @{}
+$global:restartAttempts = @{}
+
+function Get-MicupProcesses {
+    return @(Get-Process -Name "Micup" -ErrorAction SilentlyContinue)
+}
+
+function Get-MicupState([string]$micupDataDir) {
+    $p = Join-Path $micupDataDir "modules\state.json"
+    try { return (Read-TextNoBom $p | ConvertFrom-Json) } catch { return $null }
+}
+
+# Returns $null, or what Micup is showing without the mod: @{ hash; patchedAt; installedAt; sessionStart; key }.
+# A renderer is patched the first time when its pristine index.html is backed up, so the
+# backup folder's creation time is when the mod landed in it. A Micup session older than
+# that loaded the renderer before the mod was there.
+function Get-StaleMicupSession([string]$micupDataDir) {
+    $state = Get-MicupState $micupDataDir
+    if (-not $state -or -not $state.committed) { return $null }
+    $hash = [string]$state.committed.fluxer_renderer
+    if ($hash -notmatch '^[0-9a-f]{64}$') { return $null }
+    $rendererDir = Join-Path $micupDataDir "modules\store\fluxer_renderer\$hash"
+    $indexPath = Join-Path $rendererDir "index.html"
+    if (-not (Test-Path -LiteralPath $indexPath)) { return $null }
+    if ((Read-TextNoBom $indexPath) -notmatch 'miccord\.js') { return $null }  # not patched yet
+    $backupDir = Join-Path $micupDataDir "modules\miccord_backups\$hash"
+    if (-not (Test-Path -LiteralPath $backupDir)) { return $null }
+    $patchedAt = (Get-Item -LiteralPath $backupDir).CreationTime
+
+    $starts = @(Get-MicupProcesses | ForEach-Object { try { $_.StartTime } catch { $null } } | Where-Object { $_ })
+    if ($starts.Count -eq 0) { return $null }
+    $sessionStart = ($starts | Sort-Object | Select-Object -First 1)
+    if ($sessionStart -ge $patchedAt) { return $null }
+    return @{
+        hash         = $hash
+        patchedAt    = $patchedAt
+        installedAt  = (Get-Item -LiteralPath $rendererDir).CreationTime
+        sessionStart = $sessionStart
+        key          = "$hash@$($sessionStart.ToString('o'))"
+    }
+}
+
+function Show-GuardNotice([string]$text) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        if ($global:noticeIcon) { $global:noticeIcon.Dispose() }
+        $icon = New-Object System.Windows.Forms.NotifyIcon
+        $icon.Icon = [System.Drawing.SystemIcons]::Information
+        $icon.Text = "Better MicUP"
+        $icon.BalloonTipTitle = "Better MicUP"
+        $icon.BalloonTipText = $text
+        $icon.Visible = $true
+        $icon.ShowBalloonTip(10000)
+        $global:noticeIcon = $icon
+        $global:noticeUntil = (Get-Date).AddSeconds(30)
+    } catch {
+        Write-GuardLog "Could not show a notification: $($_.Exception.Message)"
+    }
+}
+
+function Clear-GuardNotice {
+    if ($global:noticeIcon -and $global:noticeUntil -and (Get-Date) -ge $global:noticeUntil) {
+        try { $global:noticeIcon.Dispose() } catch {}
+        $global:noticeIcon = $null
+        $global:noticeUntil = $null
+    }
+}
+
+# Micup marks a launch attempt in state.json until the new renderer reports it started;
+# closing it in the middle would count as a failed launch and could roll the update back.
+function Wait-MicupLaunchSettled([string]$micupDataDir, [int]$timeoutSeconds = 60) {
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $state = Get-MicupState $micupDataDir
+        if ($state -and [int]$state.boot_attempt -eq 0) { return $true }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+function Restart-Micup {
+    $procs = Get-MicupProcesses
+    if ($procs.Count -eq 0) { return $false }
+    $exe = ($procs | ForEach-Object { try { $_.Path } catch { $null } } | Where-Object { $_ } | Select-Object -First 1)
+    # Store (MSIX) apps must be started through their app id, not their exe.
+    $appUserModelId = $null
+    if ($exe -and $exe -like "*\WindowsApps\*") {
+        try {
+            $pkg = Get-AppxPackage -Name "Micup.Micup" -ErrorAction Stop | Select-Object -First 1
+            $appId = @(($pkg | Get-AppxPackageManifest).Package.Applications.Application | ForEach-Object { $_.Id })[0]
+            if ($pkg -and $appId) { $appUserModelId = "$($pkg.PackageFamilyName)!$appId" }
+        } catch {}
+        if (-not $appUserModelId) {
+            Write-GuardLog "Could not find Micup's app id; not restarting it."
+            return $false
+        }
+    }
+    if (-not $exe) { return $false }
+
+    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-MicupProcesses).Count -gt 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+    Start-Sleep -Milliseconds 800
+    if ($appUserModelId) {
+        Start-Process -FilePath "explorer.exe" -ArgumentList "shell:AppsFolder\$appUserModelId"
+    } else {
+        Start-Process -FilePath $exe
+    }
+    return $true
+}
+
+function Invoke-StaleSessionCheck {
+    $cfg = Get-UpdateConfig
+    foreach ($d in (Find-MicupDataDirs)) {
+        $stale = $null
+        try { $stale = Get-StaleMicupSession $d } catch { Write-GuardLog "Session check failed: $($_.Exception.Message)" }
+        if (-not $stale) { continue }
+
+        # Mod applied within a few minutes of the renderer being installed, and that renderer
+        # is what Micup shows: Micup just updated and reloaded itself in place.
+        $justUpdated = (((Get-Date) - $stale.installedAt).TotalMinutes -le 10) -and
+            ((($stale.patchedAt - $stale.installedAt).TotalMinutes) -le 3)
+        $attempts = [int]$global:restartAttempts[$stale.key]
+        if ($cfg.autoRestartMicup -and $justUpdated -and $attempts -lt 1) {
+            $global:restartAttempts[$stale.key] = $attempts + 1
+            if (-not (Wait-MicupLaunchSettled $d)) {
+                Write-GuardLog "Micup is still confirming the update for $($stale.hash); not restarting it."
+            } else {
+                Write-GuardLog "Micup updated in place to $($stale.hash) before the mod was applied; reopening it."
+                Show-GuardNotice "O Micup atualizou. Reabrindo para reativar o Better MicUP..."
+                if (Restart-Micup) { continue }
+            }
+        }
+        if (-not $global:noticedSessions.ContainsKey($stale.key)) {
+            $global:noticedSessions[$stale.key] = $true
+            Write-GuardLog "Micup session from $($stale.sessionStart) is running without the mod; asked to reopen it."
+            # guard.ps1 stays ASCII (PowerShell 5.1 reads BOM-less scripts as ANSI): accents via [char].
+            Show-GuardNotice ("O Micup est$([char]0xE1) aberto sem o Better MicUP. Feche pela bandeja (bot$([char]0xE3)o direito > Sair) e abra de novo para ativar.")
+        }
+    }
+}
+
+# ------------------------------------------------------------------------------
 # Auto-update
 # ------------------------------------------------------------------------------
 function Get-InstalledVersion {
@@ -341,12 +497,13 @@ function Get-InstalledVersion {
 }
 
 function Get-UpdateConfig {
-    $cfg = @{ enabled = $true; manifestUrl = $UpdateManifestUrl }
+    $cfg = @{ enabled = $true; manifestUrl = $UpdateManifestUrl; autoRestartMicup = $true }
     $p = Join-Path $scriptDir "update-config.json"
     if (Test-Path -LiteralPath $p) {
         try {
             $o = Read-TextNoBom $p | ConvertFrom-Json
             if ($o.autoUpdate -eq $false) { $cfg.enabled = $false }
+            if ($o.autoRestartMicup -eq $false) { $cfg.autoRestartMicup = $false }
             if ($o.manifestUrl) { $cfg.manifestUrl = [string]$o.manifestUrl }
         } catch {
             Write-GuardLog "update-config.json is not valid JSON; using defaults."
@@ -488,9 +645,10 @@ try {
         exit 0
     }
 
-    Write-GuardLog "Guard v3 started (version $(Get-InstalledVersion), CheckOnly=$CheckOnly)."
+    Write-GuardLog "Guard v4 started (version $(Get-InstalledVersion), CheckOnly=$CheckOnly)."
     Invoke-PatchAll | Out-Null
     if ($CheckOnly) { exit 0 }
+    Invoke-StaleSessionCheck
 
     $i = 0
     foreach ($d in (Find-MicupDataDirs)) {
@@ -525,11 +683,14 @@ try {
         if ($pending -and ($now - $lastEvent).TotalSeconds -ge 5) {
             $pending = $false
             Invoke-PatchAll | Out-Null
+            Invoke-StaleSessionCheck
             $lastCheck = $now
         } elseif (($now - $lastCheck).TotalSeconds -ge 60) {
             Invoke-PatchAll | Out-Null
+            Invoke-StaleSessionCheck
             $lastCheck = $now
         }
+        Clear-GuardNotice
 
         if ($now -ge $nextUpdateCheck) {
             $nextUpdateCheck = $now.AddHours($UpdateIntervalHours)

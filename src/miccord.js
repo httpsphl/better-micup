@@ -15,7 +15,7 @@
   if (window.__MICCORD_INITIALIZED__) return;
   window.__MICCORD_INITIALIZED__ = true;
 
-  const VERSION = "1.0.5";
+  const VERSION = "1.0.6";
   const STORAGE_KEY = "miccord_settings_v1";
   const MSGLOG_KEY = "miccord_message_logs_v1";
   const SS_EVENTS_KEY = "miccord_screenshare_events_v1";

@@ -23,7 +23,9 @@ itself when a new version is released.
   - **Atalhos**: F12 / Ctrl+Shift+I for DevTools, Ctrl+Shift+M for these settings
 - **Themes**: built-in presets (or Micup's original look) plus a live QuickCSS editor
 - **Stays applied**: a small background watcher re-applies the mod after every Micup update,
-  without touching Micup's own update and rollback state
+  without touching Micup's own update and rollback state. When Micup updates itself in place
+  (it reloads its window before the mod can be re-applied), the watcher reopens Micup once
+  so the mod comes back
 - **Signed auto-updates**: new versions install by themselves; only releases signed with the
   project's key are accepted
 
@@ -46,7 +48,8 @@ removes the startup entry and deletes the mod's folder.
 
 The watcher checks for a new release every 3 hours. Updates take effect the next time Micup
 is opened. To turn automatic updates off, create `%APPDATA%\BetterMicUP\update-config.json`
-containing `{ "autoUpdate": false }`.
+containing `{ "autoUpdate": false }`. To stop the watcher from reopening Micup after an in-place
+Micup update (it will show a notification instead), add `"autoRestartMicup": false` to that file.
 
 ## Development
 
