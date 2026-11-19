@@ -349,6 +349,17 @@ function Get-MicupProcesses {
     return @(Get-Process -Name "Micup" -ErrorAction SilentlyContinue)
 }
 
+# When the current Micup session started. Main (browser) processes are the ones without a
+# --type= switch. An old instance that hangs while quitting can linger next to the new one
+# (seen on 2026-11-17: no window, still holding its GPU/network/audio processes), so the
+# newest main process is the session the user is looking at.
+function Get-MicupSessionStart {
+    $mains = @(Get-CimInstance Win32_Process -Filter "Name='Micup.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--type=' })
+    if ($mains.Count -eq 0) { return $null }
+    return ($mains | Sort-Object CreationDate -Descending | Select-Object -First 1).CreationDate
+}
+
 function Get-MicupState([string]$micupDataDir) {
     $p = Join-Path $micupDataDir "modules\state.json"
     try { return (Read-TextNoBom $p | ConvertFrom-Json) } catch { return $null }
@@ -371,9 +382,8 @@ function Get-StaleMicupSession([string]$micupDataDir) {
     if (-not (Test-Path -LiteralPath $backupDir)) { return $null }
     $patchedAt = (Get-Item -LiteralPath $backupDir).CreationTime
 
-    $starts = @(Get-MicupProcesses | ForEach-Object { try { $_.StartTime } catch { $null } } | Where-Object { $_ })
-    if ($starts.Count -eq 0) { return $null }
-    $sessionStart = ($starts | Sort-Object | Select-Object -First 1)
+    $sessionStart = Get-MicupSessionStart
+    if (-not $sessionStart) { return $null }
     if ($sessionStart -ge $patchedAt) { return $null }
     return @{
         hash         = $hash

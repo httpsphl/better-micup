@@ -12,7 +12,11 @@ itself when a new version is released.
   Better MicUP, Plugins, Temas, Message Logger and Desenvolvedor pages
 - **Plugins**
   - **ScreenShare Plus**: Plus resolutions and frame rates for screen sharing, holds the chosen
-    frame rate under load (lowers resolution instead), automatic bitrate, live stream-health meter
+    frame rate under load (lowers resolution instead), automatic bitrate, live stream-health meter,
+    and a playout cushion that smooths the lives you watch when your connection drops packets
+  - **Frame Gen**: an "FG" button on the lives you watch generates in-between frames on your GPU
+    (WebGPU, nothing to install), so a 60 FPS live plays at your monitor's refresh rate. Uses the
+    Quality-Gen app instead when it is open
   - **Volume Booster**: per-user volume above 100%
   - **Call Timer**: call duration next to the channel name in the voice panel
   - **Message Logger**: keeps deleted messages and the previous text of edited ones

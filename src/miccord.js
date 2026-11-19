@@ -15,7 +15,7 @@
   if (window.__MICCORD_INITIALIZED__) return;
   window.__MICCORD_INITIALIZED__ = true;
 
-  const VERSION = "1.0.6";
+  const VERSION = "1.0.9";
   const STORAGE_KEY = "miccord_settings_v1";
   const MSGLOG_KEY = "miccord_message_logs_v1";
   const SS_EVENTS_KEY = "miccord_screenshare_events_v1";
@@ -126,6 +126,15 @@
         construct(target, args, newTarget) {
           const pc = Reflect.construct(target, args, newTarget === Tracked ? target : newTarget);
           peerConnections.add(pc);
+          try {
+            // Videos we receive start sampling right away (the watch smoother needs it).
+            pc.addEventListener("track", (ev) => {
+              if (ev?.track?.kind === "video") {
+                applyWatchSmoothing(ev.receiver, null);
+                scheduleStreamHealth(1000);
+              }
+            });
+          } catch {}
           return pc;
         },
       });
@@ -148,9 +157,16 @@
 
   const statsMemory = new WeakMap(); // pc -> Map(key -> { value, ts })
 
+  // Micup's own native screen share (shell 1.0.20+): a helper process captures and encodes the
+  // screen outside Chromium, so its video is not in any RTCPeerConnection. Set by the hook on
+  // Micup's voice engine; its live sender answers getStats() with WebRTC-shaped entries.
+  let nativeShareHost = null;
+  const nativeShareSender = () => nativeShareHost?.nativeScreenShare?.live?.sender || null;
+
   async function collectStreamHealth() {
-    const snap = { at: Date.now(), sending: [], receiving: [], uplinkKbps: null, rttMs: null };
-    const screenIds = new Set(liveScreenShareTracks().map((t) => t.id));
+    const snap = { at: Date.now(), sending: [], receiving: [], uplinkKbps: null, rttMs: null, native: false };
+    const screenTracks = liveScreenShareTracks();
+    const screenIds = new Set(screenTracks.map((t) => t.id));
     for (const pc of [...peerConnections]) {
       if (pc.signalingState === "closed" || pc.connectionState === "closed") {
         peerConnections.delete(pc);
@@ -162,10 +178,42 @@
       } catch {
         continue;
       }
+      ingestStatsReport(report, pc, snap, { screenIds });
+    }
+    const nativeSender = nativeShareSender();
+    if (nativeSender && typeof nativeSender.getStats === "function") {
+      snap.native = true;
+      try {
+        ingestStatsReport(await nativeSender.getStats(), nativeSender, snap, { screenIds, forceScreen: true });
+      } catch {}
+    }
+    // What Chromium agreed to capture (constraints can be lowered silently).
+    try {
+      const settings = screenTracks[0]?.getSettings?.();
+      snap.captureFps = finite(settings?.frameRate);
+    } catch {
+      snap.captureFps = null;
+    }
+
+    // If Micup re-wrapped the captured track, the ids won't match: with a screen share running
+    // and one video going out, that video is the screen.
+    if (!snap.sending.some((l) => l.screen) && screenIds.size > 0) {
+      const sources = new Set(snap.sending.map((l) => l.sourceWidth + "x" + l.sourceHeight));
+      if (sources.size === 1) snap.sending.forEach((l) => (l.screen = true));
+    }
+    snap.sending.sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0));
+    snap.receiving.sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0));
+    snap.targetFps = screenShareTargetFps;
+    return snap;
+  }
+
+  // Reads one stats report (an RTCPeerConnection's, or the native share's) into `snap`.
+  function ingestStatsReport(report, owner, snap, { screenIds, forceScreen = false }) {
+    {
       const stats = new Map();
       report.forEach((s) => stats.set(s.id, s));
-      let memory = statsMemory.get(pc);
-      if (!memory) statsMemory.set(pc, (memory = new Map()));
+      let memory = statsMemory.get(owner);
+      if (!memory) statsMemory.set(owner, (memory = new Map()));
       // Per-second rate of a cumulative counter since the previous sample.
       const perSecond = (key, value, ts) => {
         const before = memory.get(key);
@@ -191,7 +239,8 @@
           snap.sending.push({
             id: s.id,
             rid: s.rid || null,
-            screen: screenIds.has(source.trackIdentifier),
+            native: forceScreen,
+            screen: forceScreen || screenIds.has(source.trackIdentifier),
             active: s.active !== false,
             width: finite(s.frameWidth),
             height: finite(s.frameHeight),
@@ -232,6 +281,14 @@
                 ? Math.round((lostRate / (recvRate + lostRate)) * 1000) / 10
                 : null,
             jitterMs: finite(s.jitter) == null ? null : Math.round(s.jitter * 1000),
+            // Average time frames waited in the jitter buffer over the last interval.
+            bufferMs: (() => {
+              const d = perSecond(`${s.id}:jbd`, finite(s.jitterBufferDelay), s.timestamp);
+              const n = perSecond(`${s.id}:jbn`, finite(s.jitterBufferEmittedCount), s.timestamp);
+              return d != null && n ? Math.round((d / n) * 1000) : null;
+            })(),
+            newFreezes: (perSecond(`${s.id}:frz`, finite(s.freezeCount), s.timestamp) ?? 0) > 0,
+            newKeyframeRequests: (perSecond(`${s.id}:pli`, finite(s.pliCount), s.timestamp) ?? 0) > 0,
             decoder,
             hardware: isHardwareCoder(decoder, s.powerEfficientDecoder),
             codec: codecName(stats.get(s.codecId)?.mimeType),
@@ -253,18 +310,1103 @@
         }
       }
     }
-
-    // If Micup re-wrapped the captured track, the ids won't match: with a screen share running
-    // and one video going out, that video is the screen.
-    if (!snap.sending.some((l) => l.screen) && screenIds.size > 0) {
-      const sources = new Set(snap.sending.map((l) => l.sourceWidth + "x" + l.sourceHeight));
-      if (sources.size === 1) snap.sending.forEach((l) => (l.screen = true));
-    }
-    snap.sending.sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0));
-    snap.receiving.sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0));
-    snap.targetFps = screenShareTargetFps;
-    return snap;
   }
+
+  // --------------------------------------------------------------------------
+  // Watch smoother: a small playout cushion for the videos we receive.
+  // WebRTC plays received video with the smallest delay it can. On a link that loses a few
+  // packets, every loss makes a frame wait for its retransmission and the picture hitches,
+  // while people on cleaner links see the same stream smooth. Holding ~150 ms in the jitter
+  // buffer lets the resend arrive before the frame is due.
+  // --------------------------------------------------------------------------
+  const WATCH_SMOOTHING_MS = 150;
+  // If the picture still freezes with 150 ms (a burst of losses needs more than one resend
+  // round), go up once more. Measured on 2026-11-18: a link with ~2% loss and 30-60 ms delay
+  // spikes every 10 s still hitched at 150 ms.
+  const WATCH_SMOOTHING_MAX_MS = 300;
+  const smoothedReceivers = new WeakMap(); // receiver -> { targetMs, reason, since }
+
+  function watchSmoothingMode() {
+    const cfg = state?.settings?.plugins?.ScreenShareBypass;
+    if (!cfg?.enabled) return "off";
+    return cfg.smoothWatching === "always" || cfg.smoothWatching === "off" ? cfg.smoothWatching : "auto";
+  }
+
+  function setReceiverTarget(receiver, ms) {
+    try {
+      if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = ms;
+      else if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = ms == null ? null : ms / 1000;
+      else return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // `entry`: this receiver's inbound stats from the last sample (null right after it appears).
+  function applyWatchSmoothing(receiver, entry) {
+    if (!receiver || receiver.track?.kind !== "video") return;
+    const mode = watchSmoothingMode();
+    const current = smoothedReceivers.get(receiver);
+    if (mode === "off") {
+      if (current) {
+        setReceiverTarget(receiver, null);
+        smoothedReceivers.delete(receiver);
+      }
+      return;
+    }
+    if (current) {
+      // Once on, it stays on for this stream (no back-and-forth); it may only go up.
+      const stillFreezing = entry && (entry.newFreezes || entry.newKeyframeRequests);
+      if (stillFreezing && current.targetMs < WATCH_SMOOTHING_MAX_MS && Date.now() - current.since >= 10000) {
+        if (setReceiverTarget(receiver, WATCH_SMOOTHING_MAX_MS)) {
+          smoothedReceivers.set(receiver, { targetMs: WATCH_SMOOTHING_MAX_MS, reason: current.reason, since: Date.now() });
+          recordScreenShareEvent("watch-smoothing", {
+            reason: entry.newFreezes ? "freeze" : "keyframe",
+            targetMs: WATCH_SMOOTHING_MAX_MS,
+            lossPct: entry.lossPct ?? null,
+            resolution: entry.width ? `${entry.width}×${entry.height}` : null,
+          });
+        }
+      }
+      return;
+    }
+    let reason = null;
+    if (mode === "always") reason = "always";
+    else if (entry) {
+      if ((entry.lossPct ?? 0) >= 0.5) reason = "loss";
+      else if (entry.newFreezes) reason = "freeze";
+      else if (entry.newKeyframeRequests) reason = "keyframe";
+      else if ((entry.jitterMs ?? 0) >= 30) reason = "jitter";
+    }
+    if (!reason) return;
+    if (!setReceiverTarget(receiver, WATCH_SMOOTHING_MS)) return;
+    smoothedReceivers.set(receiver, { targetMs: WATCH_SMOOTHING_MS, reason, since: Date.now() });
+    if (reason !== "always") {
+      recordScreenShareEvent("watch-smoothing", {
+        reason,
+        targetMs: WATCH_SMOOTHING_MS,
+        lossPct: entry?.lossPct ?? null,
+        jitterMs: entry?.jitterMs ?? null,
+        resolution: entry?.width ? `${entry.width}×${entry.height}` : null,
+      });
+    }
+  }
+
+  function receivingVideo() {
+    for (const pc of peerConnections) {
+      try {
+        if (pc.getReceivers().some((r) => r.track?.kind === "video" && r.track.readyState === "live")) return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  function tuneReceivers(snap) {
+    for (const pc of peerConnections) {
+      let receivers = [];
+      try {
+        receivers = pc.getReceivers();
+      } catch {}
+      for (const r of receivers) {
+        if (r.track?.kind !== "video") continue;
+        const entry = snap.receiving.find((e) => e.trackId && e.trackId === r.track.id) || null;
+        applyWatchSmoothing(r, entry);
+        if (entry) entry.smoothingMs = smoothedReceivers.get(r)?.targetMs ?? null;
+      }
+    }
+  }
+
+  // <fg-engine>
+  // Built-in frame generation for lives you watch (WebGPU). Per real frame: copy the video frame,
+  // build a luma pyramid, estimate forward and backward optical flow coarse-to-fine (block
+  // matching), median-filter it. Per display refresh: draw the in-between frame at time t with a
+  // bidirectional backward warp, weighted by flow consistency (occlusions fall back to the nearest
+  // real frame). Shows each real frame one frame late, which is what makes the in-betweens possible.
+  const FG_WGSL = /* wgsl */ `
+  struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+  @vertex fn vsFull(@builtin(vertex_index) i: u32) -> VO {
+    var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+    var o: VO;
+    o.pos = vec4f(p[i], 0.0, 1.0);
+    o.uv = vec2f((p[i].x + 1.0) * 0.5, (1.0 - p[i].y) * 0.5);
+    return o;
+  }
+
+  // ---- copy the current video frame (external texture) into our own texture
+  @group(0) @binding(0) var extSrc: texture_external;
+  @group(0) @binding(1) var extSamp: sampler;
+  @fragment fn fsCopy(v: VO) -> @location(0) vec4f {
+    return vec4f(textureSampleBaseClampToEdge(extSrc, extSamp, v.uv).rgb, 1.0);
+  }
+  `;
+
+  const FG_WGSL_LUMA = /* wgsl */ `
+  // Level 0 of the pyramid: luma at 1/4 of the frame, each texel the mean of a 4x4 block.
+  @group(0) @binding(0) var src: texture_2d<f32>;
+  @group(0) @binding(1) var samp: sampler;
+  @group(0) @binding(2) var dst: texture_storage_2d<r32float, write>;
+  @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3u) {
+    let size = textureDimensions(dst);
+    if (id.x >= size.x || id.y >= size.y) { return; }
+    let texel = 1.0 / vec2f(textureDimensions(src));
+    let uv = (vec2f(id.xy) + 0.5) / vec2f(size);
+    var acc = 0.0;
+    for (var j = 0; j < 2; j++) {
+      for (var i = 0; i < 2; i++) {
+        let off = (vec2f(f32(i), f32(j)) * 2.0 - 1.0) * texel;
+        acc += dot(textureSampleLevel(src, samp, uv + off, 0.0).rgb, vec3f(0.299, 0.587, 0.114));
+      }
+    }
+    textureStore(dst, id.xy, vec4f(acc * 0.25, 0.0, 0.0, 1.0));
+  }
+  `;
+
+  const FG_WGSL_DOWN = /* wgsl */ `
+  // Next pyramid level: 2x2 mean (r32float is not filterable, so load by hand).
+  @group(0) @binding(0) var src: texture_2d<f32>;
+  @group(0) @binding(1) var dst: texture_storage_2d<r32float, write>;
+  @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3u) {
+    let size = textureDimensions(dst);
+    if (id.x >= size.x || id.y >= size.y) { return; }
+    let s = vec2i(textureDimensions(src)) - 1;
+    let p = vec2i(id.xy) * 2;
+    let v = textureLoad(src, min(p, s), 0).r + textureLoad(src, min(p + vec2i(1, 0), s), 0).r +
+            textureLoad(src, min(p + vec2i(0, 1), s), 0).r + textureLoad(src, min(p + vec2i(1, 1), s), 0).r;
+    textureStore(dst, id.xy, vec4f(v * 0.25, 0.0, 0.0, 1.0));
+  }
+  `;
+
+  const FG_WGSL_FLOW = /* wgsl */ `
+  // One pyramid level of block-matching flow from A to B: for each texel of A, the offset d that
+  // best matches a 5x5 patch in B, searched around the (upsampled) coarser estimate, with a small
+  // pull toward that estimate where the image is flat, and a parabola fit for sub-texel precision.
+  struct Params { radius: i32, hasCoarse: u32, lambda: f32, pad: f32 };
+  @group(0) @binding(0) var lumA: texture_2d<f32>;
+  @group(0) @binding(1) var lumB: texture_2d<f32>;
+  @group(0) @binding(2) var coarse: texture_2d<f32>;
+  @group(0) @binding(3) var outFlow: texture_storage_2d<rgba16float, write>;
+  @group(0) @binding(4) var<uniform> prm: Params;
+
+  fn ldA(p: vec2i) -> f32 {
+    return textureLoad(lumA, clamp(p, vec2i(0), vec2i(textureDimensions(lumA)) - 1), 0).r;
+  }
+  fn ldB(p: vec2i) -> f32 {
+    return textureLoad(lumB, clamp(p, vec2i(0), vec2i(textureDimensions(lumB)) - 1), 0).r;
+  }
+  fn patchCost(p: vec2i, d: vec2i) -> f32 {
+    var c = 0.0;
+    for (var oy = -2; oy <= 2; oy++) {
+      for (var ox = -2; ox <= 2; ox++) {
+        let o = vec2i(ox, oy);
+        c += abs(ldA(p + o) - ldB(p + o + d));
+      }
+    }
+    return c;
+  }
+
+  @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3u) {
+    let size = vec2i(textureDimensions(outFlow));
+    let p = vec2i(id.xy);
+    if (p.x >= size.x || p.y >= size.y) { return; }
+    var init = vec2f(0.0);
+    if (prm.hasCoarse == 1u) {
+      let cs = vec2i(textureDimensions(coarse)) - 1;
+      init = textureLoad(coarse, clamp(p / 2, vec2i(0), cs), 0).xy * 2.0;
+    }
+    let base = vec2i(round(init));
+    var best = 1e9;
+    var bestD = base;
+    let r = prm.radius;
+    for (var dy = -r; dy <= r; dy++) {
+      for (var dx = -r; dx <= r; dx++) {
+        let d = base + vec2i(dx, dy);
+        let dd = vec2f(d) - init;
+        let cost = patchCost(p, d) + prm.lambda * dot(dd, dd);
+        if (cost < best) { best = cost; bestD = d; }
+      }
+    }
+    // sub-texel: fit a parabola through the costs left/right and above/below the best match
+    let cx0 = patchCost(p, bestD - vec2i(1, 0));
+    let cx1 = patchCost(p, bestD + vec2i(1, 0));
+    let cy0 = patchCost(p, bestD - vec2i(0, 1));
+    let cy1 = patchCost(p, bestD + vec2i(0, 1));
+    let c0 = patchCost(p, bestD);
+    var sub = vec2f(0.0);
+    let denx = cx0 - 2.0 * c0 + cx1;
+    let deny = cy0 - 2.0 * c0 + cy1;
+    if (denx > 1e-5) { sub.x = clamp(0.5 * (cx0 - cx1) / denx, -0.5, 0.5); }
+    if (deny > 1e-5) { sub.y = clamp(0.5 * (cy0 - cy1) / deny, -0.5, 0.5); }
+    // confidence: how sharply the cost rises around the best match (flat areas: ~0) and how good
+    // the match is (occlusions: high residual)
+    let curv = max(min(denx, deny), 0.0) / 25.0;
+    let resid = c0 / 25.0;
+    let conf = clamp(curv * 25.0, 0.0, 1.0) / (1.0 + (resid / 0.04) * (resid / 0.04));
+    // where the match says little (flat area), keep the coarser estimate instead of its noise
+    var f = vec2f(bestD) + sub;
+    if (prm.hasCoarse == 1u) { f = mix(init, f, smoothstep(0.05, 0.3, conf)); }
+    textureStore(outFlow, p, vec4f(f, resid, max(conf, 0.001)));
+  }
+  `;
+
+  const FG_WGSL_SMOOTH = /* wgsl */ `
+  // Confidence-weighted, edge-aware smoothing of one flow level: flow from confident texels
+  // (edges, texture) spreads into flat areas, without crossing luma edges.
+  @group(0) @binding(0) var src: texture_2d<f32>;
+  @group(0) @binding(1) var lum: texture_2d<f32>;
+  @group(0) @binding(2) var dst: texture_storage_2d<rgba16float, write>;
+  @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3u) {
+    let size = vec2i(textureDimensions(dst));
+    let p = vec2i(id.xy);
+    if (p.x >= size.x || p.y >= size.y) { return; }
+    let c = textureLoad(src, p, 0);
+    let lc = textureLoad(lum, p, 0).r;
+    var acc = vec2f(0.0);
+    var wsum = 0.0;
+    for (var oy = -3; oy <= 3; oy++) {
+      for (var ox = -3; ox <= 3; ox++) {
+        let q = clamp(p + vec2i(ox, oy), vec2i(0), size - 1);
+        let f = textureLoad(src, q, 0);
+        let dl = textureLoad(lum, q, 0).r - lc;
+        let w = f.w * exp(-(dl * dl) / (0.06 * 0.06)) * exp(-f32(ox * ox + oy * oy) / 8.0);
+        acc += f.xy * w;
+        wsum += w;
+      }
+    }
+    var outF = c.xy;
+    if (wsum > 1e-4) { outF = acc / wsum; }
+    textureStore(dst, p, vec4f(outF, c.z, max(c.w, wsum / 6.0)));
+  }
+  `;
+
+  const FG_WGSL_MEDIAN = /* wgsl */ `
+  // 3x3 median of each flow component: removes isolated wrong matches.
+  @group(0) @binding(0) var src: texture_2d<f32>;
+  @group(0) @binding(1) var dst: texture_storage_2d<rgba16float, write>;
+  fn med9(a: array<f32, 9>) -> f32 {
+    var v = a;
+    for (var i = 0; i < 5; i++) {
+      var m = i;
+      for (var j = i + 1; j < 9; j++) { if (v[j] < v[m]) { m = j; } }
+      let t = v[i]; v[i] = v[m]; v[m] = t;
+    }
+    return v[4];
+  }
+  @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3u) {
+    let size = vec2i(textureDimensions(dst));
+    let p = vec2i(id.xy);
+    if (p.x >= size.x || p.y >= size.y) { return; }
+    var xs: array<f32, 9>;
+    var ys: array<f32, 9>;
+    var k = 0;
+    for (var oy = -1; oy <= 1; oy++) {
+      for (var ox = -1; ox <= 1; ox++) {
+        let f = textureLoad(src, clamp(p + vec2i(ox, oy), vec2i(0), size - 1), 0);
+        xs[k] = f.x; ys[k] = f.y; k++;
+      }
+    }
+    let c = textureLoad(src, p, 0);
+    textureStore(dst, p, vec4f(med9(xs), med9(ys), c.z, 1.0));
+  }
+  `;
+
+  const FG_WGSL_INTERP = /* wgsl */ `
+  struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+  @vertex fn vsFull(@builtin(vertex_index) i: u32) -> VO {
+    var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+    var o: VO;
+    o.pos = vec4f(p[i], 0.0, 1.0);
+    o.uv = vec2f((p[i].x + 1.0) * 0.5, (1.0 - p[i].y) * 0.5);
+    return o;
+  }
+  // t: 0 = previous real frame, 1 = current. Flow is in level-0 texels; scale turns it into
+  // source pixels. k: consistency tolerance in source pixels.
+  struct U { t: f32, scale: f32, k: f32, debug: f32, src: vec2f, pad: vec2f, crop: vec4f };
+  @group(0) @binding(0) var prevTex: texture_2d<f32>;
+  @group(0) @binding(1) var currTex: texture_2d<f32>;
+  @group(0) @binding(2) var flowF: texture_2d<f32>;
+  @group(0) @binding(3) var flowB: texture_2d<f32>;
+  @group(0) @binding(4) var samp: sampler;
+  @group(0) @binding(5) var<uniform> u: U;
+
+  fn fwd(px: vec2f) -> vec2f { return textureSampleLevel(flowF, samp, px / u.src, 0.0).xy * u.scale; }
+  fn bwd(px: vec2f) -> vec2f { return textureSampleLevel(flowB, samp, px / u.src, 0.0).xy * u.scale; }
+  fn colPrev(px: vec2f) -> vec3f { return textureSampleLevel(prevTex, samp, px / u.src, 0.0).rgb; }
+  fn colCurr(px: vec2f) -> vec3f { return textureSampleLevel(currTex, samp, px / u.src, 0.0).rgb; }
+
+  @fragment fn fsInterp(v: VO) -> @location(0) vec4f {
+    let x = (u.crop.xy + v.uv * u.crop.zw) * u.src;
+    let t = u.t;
+    if (u.debug > 0.5) {
+      let f = fwd(x) / 32.0;
+      return vec4f(0.5 + f.x, 0.5 + f.y, 0.5, 1.0);
+    }
+    if (t <= 0.001) { return vec4f(colPrev(x), 1.0); }
+    if (t >= 0.999) { return vec4f(colCurr(x), 1.0); }
+    // where the pixel at x came from in each real frame
+    let pPrev = x - t * fwd(x);
+    let pCurr = x - (1.0 - t) * bwd(x);
+    let cPrev = colPrev(pPrev);
+    let cCurr = colCurr(pCurr);
+    // forward-backward consistency at those points: large error = occluded or wrong flow
+    let fp = fwd(pPrev);
+    let eF = length(fp + bwd(pPrev + fp));
+    let bc = bwd(pCurr);
+    let eB = length(bc + fwd(pCurr + bc));
+    let k2 = u.k * u.k;
+    let wP = (1.0 - t) * exp(-(eF * eF) / k2);
+    let wC = t * exp(-(eB * eB) / k2);
+    if (wP + wC < 1e-3) {
+      // neither side is trustworthy here: show the nearest real frame instead of a ghost
+      return vec4f(select(colCurr(x), colPrev(x), t < 0.5), 1.0);
+    }
+    return vec4f((cPrev * wP + cCurr * wC) / (wP + wC), 1.0);
+  }
+  `;
+
+  const FG_LEVELS = 4; // pyramid levels below the 1/4 luma
+  const FG_RADII = [2, 2, 2, 5]; // search radius per level (index 0 = finest)
+
+  class FgEngine {
+    static async create(canvas) {
+      if (!navigator.gpu) throw new Error("WebGPU indisponível");
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      if (!adapter) throw new Error("Nenhuma placa de vídeo para o WebGPU");
+      const device = await adapter.requestDevice();
+      return new FgEngine(device, adapter, canvas);
+    }
+
+    constructor(device, adapter, canvas) {
+      this.device = device;
+      this.adapterInfo = adapter.info || {};
+      this.canvas = canvas;
+      this.ctx = canvas.getContext("webgpu");
+      this.format = navigator.gpu.getPreferredCanvasFormat();
+      this.ctx.configure({ device, format: this.format, alphaMode: "opaque" });
+      this.lost = false;
+      device.lost.then((info) => {
+        this.lost = true;
+        this.lostReason = info?.message || "device lost";
+      });
+      this.linear = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" });
+      const mod = (code) => device.createShaderModule({ code });
+      const copyMod = mod(FG_WGSL);
+      this.copyPipe = device.createRenderPipeline({
+        layout: "auto",
+        vertex: { module: copyMod, entryPoint: "vsFull" },
+        fragment: { module: copyMod, entryPoint: "fsCopy", targets: [{ format: "rgba8unorm" }] },
+      });
+      const comp = (code) => device.createComputePipeline({ layout: "auto", compute: { module: mod(code), entryPoint: "main" } });
+      this.lumaPipe = comp(FG_WGSL_LUMA);
+      this.downPipe = comp(FG_WGSL_DOWN);
+      this.flowPipe = comp(FG_WGSL_FLOW);
+      this.medianPipe = comp(FG_WGSL_MEDIAN);
+      this.smoothPipe = comp(FG_WGSL_SMOOTH);
+      const interpMod = mod(FG_WGSL_INTERP);
+      this.interpPipe = device.createRenderPipeline({
+        layout: "auto",
+        vertex: { module: interpMod, entryPoint: "vsFull" },
+        fragment: { module: interpMod, entryPoint: "fsInterp", targets: [{ format: this.format }] },
+      });
+      this.interpUniform = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.crop = [0, 0, 1, 1]; // visible part of the frame (uv offset, uv size)
+      this.maxHeight = 1080;    // frames taller than this are processed scaled down
+      this.flowParams = [];
+      for (let l = 0; l < FG_LEVELS; l++) {
+        const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        const data = new ArrayBuffer(16);
+        new Int32Array(data, 0, 1)[0] = FG_RADII[l];
+        new Uint32Array(data, 4, 1)[0] = l === FG_LEVELS - 1 ? 0 : 1;
+        new Float32Array(data, 8, 1)[0] = 0.02;
+        device.queue.writeBuffer(b, 0, data);
+        this.flowParams.push(b);
+      }
+      this.w = 0;
+      this.h = 0;
+      this.frames = 0; // real frames received
+      this.debugFlow = false;
+    }
+
+    // Textures for a source of w x h.
+    ensure(w, h) {
+      if (w === this.w && h === this.h) return;
+      const d = this.device;
+      this.w = w;
+      this.h = h;
+      const tex = (tw, th, format, usage) => d.createTexture({ size: [Math.max(1, tw), Math.max(1, th)], format, usage });
+      const colorUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
+      const storUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC;
+      this.color = [tex(w, h, "rgba8unorm", colorUsage), tex(w, h, "rgba8unorm", colorUsage)];
+      this.levelSize = [];
+      let lw = Math.ceil(w / 4);
+      let lh = Math.ceil(h / 4);
+      for (let l = 0; l < FG_LEVELS; l++) {
+        this.levelSize.push([lw, lh]);
+        lw = Math.ceil(lw / 2);
+        lh = Math.ceil(lh / 2);
+      }
+      // two pyramids (previous / current frame), swapped with the colour textures
+      this.luma = [0, 1].map(() => this.levelSize.map(([a, b]) => tex(a, b, "r32float", storUsage)));
+      this.flowTmp = this.levelSize.map(([a, b]) => tex(a, b, "rgba16float", storUsage));
+      this.flowF = tex(this.levelSize[0][0], this.levelSize[0][1], "rgba16float", storUsage);
+      this.flowB = tex(this.levelSize[0][0], this.levelSize[0][1], "rgba16float", storUsage);
+      this.flowTmpB = this.levelSize.map(([a, b]) => tex(a, b, "rgba16float", storUsage));
+      this.flowSm = this.levelSize.map(([a, b]) => tex(a, b, "rgba16float", storUsage));
+      this.flowSmB = this.levelSize.map(([a, b]) => tex(a, b, "rgba16float", storUsage));
+      this.noFlow = tex(1, 1, "rgba16float", GPUTextureUsage.TEXTURE_BINDING); // "no coarser level"
+      this.cur = 0; // index of the current frame's textures
+      this.frames = 0;
+    }
+
+    bg(pipe, entries) {
+      return this.device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: entries.map((resource, binding) => ({ binding, resource })) });
+    }
+
+    // A new real frame: a <video> (from requestVideoFrameCallback) or a VideoFrame.
+    pushFrame(video) {
+      if (this.lost) return false;
+      let w = video.videoWidth || video.displayWidth;
+      let h = video.videoHeight || video.displayHeight;
+      if (!w || !h) return false;
+      if (h > this.maxHeight) {
+        w = Math.round((w * this.maxHeight) / h / 2) * 2;
+        h = this.maxHeight;
+      }
+      this.ensure(w, h);
+      this.cur ^= 1;
+      const cur = this.cur;
+      const prev = cur ^ 1;
+      const d = this.device;
+      const enc = d.createCommandEncoder();
+      // 1. copy the frame
+      const ext = d.importExternalTexture({ source: video });
+      const pass = enc.beginRenderPass({ colorAttachments: [{ view: this.color[cur].createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
+      pass.setPipeline(this.copyPipe);
+      pass.setBindGroup(0, this.bg(this.copyPipe, [ext, this.linear]));
+      pass.draw(3);
+      pass.end();
+      // 2. luma pyramid
+      const cp = enc.beginComputePass();
+      const dispatch = (pipe, group, [x, y]) => {
+        cp.setPipeline(pipe);
+        cp.setBindGroup(0, group);
+        cp.dispatchWorkgroups(Math.ceil(x / 8), Math.ceil(y / 8));
+      };
+      const L = this.luma[cur];
+      dispatch(this.lumaPipe, this.bg(this.lumaPipe, [this.color[cur].createView(), this.linear, L[0].createView()]), this.levelSize[0]);
+      for (let l = 1; l < FG_LEVELS; l++) {
+        dispatch(this.downPipe, this.bg(this.downPipe, [L[l - 1].createView(), L[l].createView()]), this.levelSize[l]);
+      }
+      // 3. flow both ways, coarse to fine
+      if (this.frames >= 1) {
+        const P = this.luma[prev];
+        const run = (A, B, tmp, sm, out) => {
+          for (let l = FG_LEVELS - 1; l >= 0; l--) {
+            const coarse = l === FG_LEVELS - 1 ? this.noFlow : sm[l + 1];
+            dispatch(this.flowPipe, this.bg(this.flowPipe, [A[l].createView(), B[l].createView(), coarse.createView(), tmp[l].createView(), { buffer: this.flowParams[l] }]), this.levelSize[l]);
+            dispatch(this.smoothPipe, this.bg(this.smoothPipe, [tmp[l].createView(), A[l].createView(), sm[l].createView()]), this.levelSize[l]);
+          }
+          dispatch(this.medianPipe, this.bg(this.medianPipe, [sm[0].createView(), out.createView()]), this.levelSize[0]);
+        };
+        run(P, L, this.flowTmp, this.flowSm, this.flowF);
+        run(L, P, this.flowTmpB, this.flowSmB, this.flowB);
+      }
+      cp.end();
+      d.queue.submit([enc.finish()]);
+      this.frames++;
+      return true;
+    }
+
+    // Draw the frame between the previous and the current real frame (t in 0..1).
+    draw(t, targetView) {
+      if (this.lost || this.frames < 1) return false;
+      const d = this.device;
+      const cur = this.cur;
+      const prev = this.frames >= 2 ? cur ^ 1 : cur;
+      const tt = this.frames >= 2 ? Math.min(1, Math.max(0, t)) : 1;
+      const u = new Float32Array([tt, 4, 1.5, this.debugFlow ? 1 : 0, this.w, this.h, 0, 0, ...this.crop]);
+      d.queue.writeBuffer(this.interpUniform, 0, u);
+      const enc = d.createCommandEncoder();
+      const view = targetView || this.ctx.getCurrentTexture().createView();
+      const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
+      pass.setPipeline(this.interpPipe);
+      pass.setBindGroup(0, this.bg(this.interpPipe, [this.color[prev].createView(), this.color[cur].createView(), this.flowF.createView(), this.flowB.createView(), this.linear, { buffer: this.interpUniform }]));
+      pass.draw(3);
+      pass.end();
+      d.queue.submit([enc.finish()]);
+      return true;
+    }
+
+    destroy() {
+      try {
+        this.ctx.unconfigure();
+      } catch {}
+      try {
+        this.device.destroy();
+      } catch {}
+    }
+  }
+  // </fg-engine>
+
+  // --------------------------------------------------------------------------
+  // Quality-Gen bridge. Quality-Gen (a separate Windows app: frame generation + upscaling,
+  // captures a window and draws an overlay) listens on 127.0.0.1. Micup's CSP allows
+  // connect-src http://127.0.0.1:*, which is the only way out of the renderer sandbox.
+  // --------------------------------------------------------------------------
+  const QG_BASE = "http://127.0.0.1:47615/v1";
+  const qualityGen = { available: false, checkedAt: 0, status: null, lastError: null };
+
+  async function qgRequest(path, body, timeoutMs = 2000) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const init = body === undefined
+        ? { signal: ctrl.signal, cache: "no-store" }
+        : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal, cache: "no-store" };
+      const res = await fetch(QG_BASE + path, init);
+      let data = {};
+      try {
+        data = await res.json();
+      } catch {}
+      if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+      return data;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function qgCheck() {
+    try {
+      const status = await qgRequest("/status");
+      qualityGen.available = status?.app === "Quality-Gen";
+      qualityGen.status = status;
+      qualityGen.lastError = null;
+    } catch (e) {
+      qualityGen.available = false;
+      qualityGen.lastError = String(e?.message || e);
+    }
+    qualityGen.checkedAt = Date.now();
+    return qualityGen.available;
+  }
+
+  // Handshake when Micup opens: tells Quality-Gen which Micup/mod is talking to it.
+  async function qgHandshake() {
+    if (!(await qgCheck())) {
+      Logger.info("Quality-Gen não encontrado:", qualityGen.lastError);
+      return;
+    }
+    try {
+      const hello = await qgRequest("/hello", { client: "better-micup", version: VERSION });
+      Logger.info("Quality-Gen conectado:", qualityGen.status, hello);
+    } catch (e) {
+      qualityGen.lastError = String(e?.message || e);
+      Logger.warn("Quality-Gen respondeu ao status, mas não ao comando:", qualityGen.lastError);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Frame Gen button: hover a live you are watching and click "FG". Two engines:
+  //  - built-in (FgEngine above): WebGPU, a canvas drawn exactly over the picture, one new frame
+  //    per display refresh. Works for everyone with the update, nothing to install.
+  //  - Quality-Gen (the separate app, RIFE): generates frames over just that video (overlay 1:1
+  //    on the Micup window, click-through). Used when it is open, or when chosen.
+  // --------------------------------------------------------------------------
+  const frameGen = {
+    active: false,
+    starting: false,
+    mode: null, // "qg" | "builtin" while on
+    video: null,
+    cropKey: null,
+    pendingCrop: null,
+    pendingSince: 0,
+    button: null,
+    hovered: null,
+    watchTimer: null,
+    builtin: null,
+  };
+
+  const frameGenSettings = () => state?.settings?.plugins?.QualityGen || {};
+  const frameGenEnabled = () => !!frameGenSettings().enabled;
+  const frameGenMultiplier = () => Math.min(4, Math.max(2, Number(frameGenSettings().multiplier) || 2));
+  const frameGenEngineChoice = () => {
+    const e = frameGenSettings().engine;
+    return e === "builtin" || e === "qualitygen" ? e : "auto";
+  };
+  const builtinFgAvailable = () =>
+    typeof navigator !== "undefined" && !!navigator.gpu && typeof HTMLVideoElement !== "undefined" &&
+    "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+  // The engine a click would use right now (null: none available).
+  function frameGenModeNow() {
+    const e = frameGenEngineChoice();
+    if (e === "qualitygen") return qualityGen.available ? "qg" : null;
+    if (e === "builtin") return builtinFgAvailable() ? "builtin" : null;
+    return qualityGen.available ? "qg" : builtinFgAvailable() ? "builtin" : null;
+  }
+
+  // Videos of other people (screen shares and cameras big enough to be worth it).
+  function watchableVideos() {
+    const own = new Set(liveScreenShareTracks().map((t) => t.id));
+    return [...document.querySelectorAll("video")].filter((v) => {
+      if (!v.isConnected || v.readyState < 2 || v.videoWidth < 480) return false;
+      const tracks = v.srcObject?.getVideoTracks?.() || [];
+      if (tracks.some((t) => own.has(t.id))) return false; // your own preview
+      const r = v.getBoundingClientRect();
+      return r.width >= 320 && r.height >= 180;
+    });
+  }
+
+  // A live is followed by its video track, not by a <video> element: Micup shows the same live in
+  // a different player in fullscreen (and re-mounts tiles when the layout changes).
+  const videoTrackId = (v) => v?.srcObject?.getVideoTracks?.()[0]?.id || null;
+  const areaOf = (v) => {
+    const r = v.getBoundingClientRect();
+    return r.width * r.height;
+  };
+  function bestVideoForTrack(id) {
+    if (!id) return null;
+    const cands = watchableVideos().filter((v) => videoTrackId(v) === id);
+    const fs = document.fullscreenElement;
+    const inFs = fs ? cands.filter((v) => fs === v || fs.contains(v)) : [];
+    const pool = inFs.length ? inFs : cands;
+    return pool.sort((a, b) => areaOf(b) - areaOf(a))[0] || null;
+  }
+  // Fullscreen shows only the fullscreen element's subtree: our floating UI has to live in it.
+  const floatingUiParent = () => {
+    const fs = document.fullscreenElement;
+    return fs && !(fs instanceof HTMLVideoElement) ? fs : document.body;
+  };
+
+  // The picture inside the <video> box (object-fit contain leaves bars), clipped to the window.
+  function videoPictureRect(v) {
+    const r = v.getBoundingClientRect();
+    let left = r.left, top = r.top, right = r.right, bottom = r.bottom;
+    const fit = getComputedStyle(v).objectFit;
+    if (fit !== "fill" && fit !== "cover" && v.videoWidth && v.videoHeight) {
+      const scale = Math.min(r.width / v.videoWidth, r.height / v.videoHeight);
+      const w = v.videoWidth * scale;
+      const h = v.videoHeight * scale;
+      left = r.left + (r.width - w) / 2;
+      top = r.top + (r.height - h) / 2;
+      right = left + w;
+      bottom = top + h;
+    }
+    return {
+      left: Math.max(0, left),
+      top: Math.max(0, top),
+      right: Math.min(window.innerWidth, right),
+      bottom: Math.min(window.innerHeight, bottom),
+    };
+  }
+
+  // Crop in physical pixels of the window's client area (what Quality-Gen captures).
+  function frameGenCrop(v) {
+    const dpr = window.devicePixelRatio || 1;
+    const p = videoPictureRect(v);
+    return {
+      left: Math.ceil(p.left * dpr),
+      top: Math.ceil(p.top * dpr),
+      right: Math.ceil((window.innerWidth - p.right) * dpr),
+      bottom: Math.ceil((window.innerHeight - p.bottom) * dpr),
+    };
+  }
+
+  const cropKeyOf = (c) => `${c.left},${c.top},${c.right},${c.bottom}`;
+  // The numbers go on the FG button; Quality-Gen's own counter would sit on the picture.
+  const frameGenStartBody = (crop) => ({ crop, multiplier: frameGenMultiplier(), showFps: !!frameGenSettings().showCounter });
+
+  // One button for the whole session; renderFrameGenButton puts it in the page or in the
+  // fullscreen element (and back when that element goes away with it inside).
+  function ensureFrameGenButton() {
+    if (frameGen.button) return frameGen.button;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "bmu-fg-btn";
+    b.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (frameGen.active || frameGen.starting) stopFrameGen("button");
+      else if (frameGen.hovered) startFrameGen(frameGen.hovered);
+    });
+    document.body.appendChild(b);
+    frameGen.button = b;
+    return b;
+  }
+
+  // Micup's own stream pill on the tile ("1080p 60 FPS · LIVE", top right). The FG button sits
+  // just left of it, so it reads as part of the stream info and stays off the picture's content.
+  const STREAM_PILL = '[data-flx="voice.stream-info-pill.container"], [data-flx="voice.stream-info-pill.pill"]';
+  function frameGenAnchor(video) {
+    let el = video.parentElement;
+    for (let i = 0; el && i < 8; i++, el = el.parentElement) {
+      const pill = el.querySelector(STREAM_PILL);
+      if (pill) {
+        const pr = pill.getBoundingClientRect();
+        if (pr.width > 0 && pr.height > 0) return { right: pr.left - 6, centerY: pr.top + pr.height / 2 };
+        break;
+      }
+    }
+    const vr = video.getBoundingClientRect(); // no pill: top-right corner of the video
+    return { right: vr.right - 8, centerY: vr.top + 19 };
+  }
+
+  function frameGenLabel() {
+    const mode = frameGen.active || frameGen.starting ? frameGen.mode : frameGenModeNow();
+    const label = mode === "qg" ? `FG ${frameGenMultiplier()}x` : "FG";
+    if (frameGen.starting) return `${label} …`;
+    if (frameGen.active && mode === "builtin") {
+      const b = frameGen.builtin;
+      return b?.realFps > 0 ? `${label} · ${Math.round(b.realFps)}→${Math.round(b.shownFps)}` : `${label} ●`;
+    }
+    const s = qualityGen.status;
+    if (frameGen.active && s?.micup && s.realFps > 0) {
+      return `${label} · ${Math.round(s.realFps)}→${Math.round(s.realFps + (s.generatedFps || 0))}`;
+    }
+    return frameGen.active ? `${label} ●` : label;
+  }
+
+  function renderFrameGenButton() {
+    const target = frameGen.active || frameGen.starting ? frameGen.video : frameGen.hovered;
+    const usable = frameGen.active || frameGen.starting || frameGenModeNow() != null;
+    if (!frameGenEnabled() || !usable || !target || !target.isConnected) {
+      if (frameGen.button) frameGen.button.style.display = "none";
+      return;
+    }
+    const b = ensureFrameGenButton();
+    const parent = floatingUiParent();
+    if (b.parentElement !== parent) parent.appendChild(b);
+    const mode = frameGen.active || frameGen.starting ? frameGen.mode : frameGenModeNow();
+    b.textContent = frameGenLabel();
+    b.classList.toggle("is-on", frameGen.active);
+    b.title = frameGen.active
+      ? `${mode === "qg" ? "Quality-Gen" : "Better MicUP"} gerando quadros nesta live (quadros reais → na tela). Clique para desligar.`
+      : mode === "qg"
+        ? `Assistir esta live com ${frameGenMultiplier()}x mais quadros (Quality-Gen).`
+        : "Assistir esta live com quadros gerados até a taxa do seu monitor.";
+    b.style.display = "block";
+    const a = frameGenAnchor(target);
+    b.style.left = `${Math.round(Math.max(4, a.right - b.offsetWidth))}px`;
+    b.style.top = `${Math.round(Math.max(4, a.centerY - b.offsetHeight / 2))}px`;
+  }
+
+  // ---- built-in engine: a canvas over the picture, fed by the video's frames
+  function placeFgCanvas(st) {
+    const { canvas, video, engine } = st;
+    if (!video.isConnected) return;
+    if (canvas.previousElementSibling !== video) video.insertAdjacentElement("afterend", canvas);
+    const r = video.getBoundingClientRect();
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!r.width || !r.height || !vw || !vh) return;
+    const fit = getComputedStyle(video).objectFit;
+    let pic = { left: r.left, top: r.top, width: r.width, height: r.height };
+    let crop = [0, 0, 1, 1];
+    if (fit === "cover") {
+      const sc = Math.max(r.width / vw, r.height / vh);
+      const visW = r.width / sc / vw;
+      const visH = r.height / sc / vh;
+      crop = [(1 - visW) / 2, (1 - visH) / 2, visW, visH];
+    } else if (fit !== "fill") {
+      const sc = Math.min(r.width / vw, r.height / vh);
+      const w = vw * sc;
+      const h = vh * sc;
+      pic = { left: r.left + (r.width - w) / 2, top: r.top + (r.height - h) / 2, width: w, height: h };
+    }
+    engine.crop = crop;
+    // where left/top = 0 lands (the canvas's positioning context), then line it up with the picture
+    const cr = canvas.getBoundingClientRect();
+    const ox = cr.left - (parseFloat(canvas.style.left) || 0);
+    const oy = cr.top - (parseFloat(canvas.style.top) || 0);
+    canvas.style.left = `${pic.left - ox}px`;
+    canvas.style.top = `${pic.top - oy}px`;
+    canvas.style.width = `${pic.width}px`;
+    canvas.style.height = `${pic.height}px`;
+    const dpr = window.devicePixelRatio || 1;
+    const cw = Math.max(1, Math.round(pic.width * dpr));
+    const ch = Math.max(1, Math.round(pic.height * dpr));
+    if (canvas.width !== cw || canvas.height !== ch) {
+      canvas.width = cw;
+      canvas.height = ch;
+    }
+  }
+
+  async function startBuiltinFg(video) {
+    const canvas = document.createElement("canvas");
+    canvas.className = "bmu-fg-canvas";
+    canvas.style.left = "0px";
+    canvas.style.top = "0px";
+    video.insertAdjacentElement("afterend", canvas);
+    let engine;
+    try {
+      engine = await FgEngine.create(canvas);
+    } catch (e) {
+      canvas.remove();
+      throw e;
+    }
+    const st = { engine, canvas, video, segStart: 0, interval: 1000 / 60, lastArrival: 0, real: 0, drawn: 0, statAt: performance.now(), realFps: 0, shownFps: 0, raf: 0, vfc: 0, n: 0, stopped: false };
+    frameGen.builtin = st;
+    placeFgCanvas(st);
+    // each real frame: copy + flow; then show it one frame late, filling the gap with in-betweens
+    const onFrame = (now) => {
+      if (st.stopped) return;
+      try {
+        if (engine.pushFrame(st.video)) {
+          if (st.lastArrival) st.interval = st.interval * 0.85 + Math.min(100, Math.max(5, now - st.lastArrival)) * 0.15;
+          st.lastArrival = now;
+          st.segStart = now;
+          st.real++;
+        }
+      } catch (e) {
+        Logger.warn("Frame Gen: falha ao processar um quadro:", e);
+      }
+      st.vfc = st.video.requestVideoFrameCallback(onFrame);
+    };
+    // Same live in another <video> (fullscreen player, re-mounted tile): move over, keep going
+    st.attach = (next) => {
+      if (next === st.video) return;
+      try {
+        st.video.cancelVideoFrameCallback(st.vfc);
+      } catch {}
+      st.video = next;
+      next.insertAdjacentElement("afterend", st.canvas);
+      st.vfc = next.requestVideoFrameCallback(onFrame);
+      placeFgCanvas(st);
+    };
+    st.vfc = video.requestVideoFrameCallback(onFrame);
+    const loop = (now) => {
+      if (st.stopped) return;
+      if (engine.lost) {
+        stopFrameGen("gpu-lost");
+        showToast("A placa de vídeo interrompeu o Frame Gen. Clique em FG para tentar de novo.", "error");
+        return;
+      }
+      if (st.n++ % 10 === 0) placeFgCanvas(st);
+      try {
+        if (engine.draw((now - st.segStart) / st.interval)) st.drawn++;
+      } catch (e) {
+        Logger.warn("Frame Gen: falha ao desenhar:", e);
+      }
+      if (now - st.statAt >= 1000) {
+        st.realFps = (st.real * 1000) / (now - st.statAt);
+        st.shownFps = (st.drawn * 1000) / (now - st.statAt);
+        st.real = 0;
+        st.drawn = 0;
+        st.statAt = now;
+        renderFrameGenButton();
+      }
+      st.raf = requestAnimationFrame(loop);
+    };
+    st.raf = requestAnimationFrame(loop);
+  }
+
+  function stopBuiltinFg() {
+    const st = frameGen.builtin;
+    if (!st) return;
+    st.stopped = true;
+    cancelAnimationFrame(st.raf);
+    try {
+      st.video.cancelVideoFrameCallback(st.vfc);
+    } catch {}
+    try {
+      st.engine.destroy();
+    } catch {}
+    st.canvas.remove();
+    frameGen.builtin = null;
+  }
+
+  async function startFrameGen(video) {
+    if (frameGen.starting) return;
+    const mode = frameGenModeNow();
+    if (!mode) return;
+    frameGen.starting = true;
+    frameGen.mode = mode;
+    frameGen.video = video;
+    frameGen.trackId = videoTrackId(video);
+    frameGen.missingSince = 0;
+    renderFrameGenButton();
+    try {
+      if (mode === "builtin") {
+        await startBuiltinFg(video);
+      } else {
+        const crop = frameGenCrop(video);
+        frameGen.lastStartAt = Date.now();
+        await qgRequest("/start", frameGenStartBody(crop), 5000);
+        frameGen.cropKey = cropKeyOf(crop);
+      }
+      frameGen.active = true;
+      recordScreenShareEvent("framegen-on", {
+        engine: mode === "qg" ? "Quality-Gen" : "embutido",
+        multiplier: mode === "qg" ? frameGenMultiplier() : null,
+        size: `${video.videoWidth}×${video.videoHeight}`,
+      });
+      watchFrameGen();
+    } catch (e) {
+      const msg = String(e?.message || e);
+      frameGen.video = null;
+      frameGen.mode = null;
+      showToast(
+        mode === "builtin"
+          ? `Não deu para ligar o Frame Gen: ${msg}`
+          : msg === "busy"
+            ? "O Quality-Gen já está gerando quadros em outra janela."
+            : msg.includes("micup window")
+              ? "O Quality-Gen não achou a janela do Micup."
+              : `Não deu para ligar o Quality-Gen: ${msg}`,
+        "error"
+      );
+    } finally {
+      frameGen.starting = false;
+      renderFrameGenButton();
+    }
+  }
+
+  async function stopFrameGen(reason) {
+    const wasActive = frameGen.active;
+    const mode = frameGen.mode;
+    frameGen.active = false;
+    frameGen.video = null;
+    frameGen.mode = null;
+    frameGen.trackId = null;
+    frameGen.cropKey = null;
+    frameGen.pendingCrop = null;
+    clearInterval(frameGen.watchTimer);
+    frameGen.watchTimer = null;
+    if (mode === "builtin") stopBuiltinFg();
+    renderFrameGenButton();
+    if (!wasActive) return;
+    recordScreenShareEvent("framegen-off", { reason });
+    if (mode === "qg") {
+      try {
+        await qgRequest("/stop", {});
+      } catch {}
+    }
+  }
+
+  // While on: stop when the live goes away. Quality-Gen also needs the crop re-sent when the
+  // layout changes (the built-in canvas follows the video by itself).
+  function watchFrameGen() {
+    clearInterval(frameGen.watchTimer);
+    frameGen.watchTimer = setInterval(() => {
+      if (!frameGen.active || !frameGen.video) return;
+      const best = bestVideoForTrack(frameGen.trackId) ||
+        (watchableVideos().includes(frameGen.video) ? frameGen.video : null);
+      if (!best) {
+        // layout transitions remount the player for a moment; give it a bit before giving up
+        frameGen.missingSince = frameGen.missingSince || Date.now();
+        if (Date.now() - frameGen.missingSince > 1500) stopFrameGen("video-gone");
+        return;
+      }
+      frameGen.missingSince = 0;
+      if (best !== frameGen.video) {
+        frameGen.video = best;
+        if (frameGen.mode === "builtin") frameGen.builtin?.attach(best);
+      }
+      const v = frameGen.video;
+      if (frameGen.mode !== "qg") {
+        renderFrameGenButton();
+        return;
+      }
+      frameGen.tick = (frameGen.tick || 0) + 1;
+      if (frameGen.tick % 3 === 0) {
+        qgCheck().then(() => {
+          // Stopped from Quality-Gen itself (its hotkey or window): reflect it here. A restart
+          // for a new crop also passes through "stopped" for a moment, so wait for two polls.
+          const s = qualityGen.status;
+          const stoppedThere = qualityGen.available && s && !s.micup && s.state === "stopped" && !frameGen.starting && Date.now() - (frameGen.lastStartAt || 0) > 3000;
+          frameGen.stoppedPolls = stoppedThere ? (frameGen.stoppedPolls || 0) + 1 : 0;
+          if (frameGen.active && frameGen.mode === "qg" && frameGen.stoppedPolls >= 2) {
+            frameGen.stoppedPolls = 0;
+            frameGen.active = false;
+            frameGen.video = null;
+            frameGen.mode = null;
+            clearInterval(frameGen.watchTimer);
+            frameGen.watchTimer = null;
+            recordScreenShareEvent("framegen-off", { reason: "stopped-in-quality-gen" });
+          }
+          renderFrameGenButton();
+        });
+      }
+      renderFrameGenButton();
+      const crop = frameGenCrop(v);
+      const key = cropKeyOf(crop);
+      if (key === frameGen.cropKey) {
+        frameGen.pendingCrop = null;
+        return;
+      }
+      if (frameGen.pendingCrop !== key) {
+        frameGen.pendingCrop = key;
+        frameGen.pendingSince = Date.now();
+        return;
+      }
+      if (Date.now() - frameGen.pendingSince < 600 || frameGen.starting) return;
+      frameGen.cropKey = key;
+      frameGen.pendingCrop = null;
+      frameGen.lastStartAt = Date.now();
+      qgRequest("/start", frameGenStartBody(crop), 5000).catch((e) => {
+        Logger.warn("Quality-Gen não aceitou o novo recorte:", e);
+        stopFrameGen("restart-failed");
+      });
+    }, 400);
+  }
+
+  function frameGenPointer(ev) {
+    if (!frameGenEnabled() || frameGen.active || frameGen.starting) return;
+    if (ev.target === frameGen.button) return;
+    const hit = watchableVideos().find((v) => {
+      const r = v.getBoundingClientRect();
+      return ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom;
+    }) || null;
+    if (hit !== frameGen.hovered) {
+      frameGen.hovered = hit;
+      // Quality-Gen opened after Micup: look again when a live is hovered (at most every 10 s)
+      if (hit && !qualityGen.available && Date.now() - qualityGen.checkedAt > 10000) {
+        qgCheck().then(renderFrameGenButton);
+      }
+      renderFrameGenButton();
+    }
+  }
+
+  (function installFrameGen() {
+    let queued = false;
+    document.addEventListener(
+      "pointermove",
+      (ev) => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(() => {
+          queued = false;
+          try {
+            frameGenPointer(ev);
+          } catch {}
+        });
+      },
+      { passive: true, capture: true }
+    );
+    // Entering/leaving fullscreen swaps the player: follow the live right away, not 400 ms later.
+    document.addEventListener("fullscreenchange", () => {
+      setTimeout(() => {
+        try {
+          if (frameGen.active && frameGen.video) {
+            const best = bestVideoForTrack(frameGen.trackId);
+            if (best && best !== frameGen.video) {
+              frameGen.video = best;
+              if (frameGen.mode === "builtin") frameGen.builtin?.attach(best);
+            }
+            if (frameGen.builtin) placeFgCanvas(frameGen.builtin);
+          }
+          renderFrameGenButton();
+          renderStatsOverlay(streamHealth.last);
+        } catch {}
+      }, 50);
+    });
+    // Micup closing or reloading: don't leave the overlay over a window that is gone.
+    window.addEventListener("pagehide", () => {
+      if (!frameGen.active || frameGen.mode !== "qg") return;
+      try {
+        fetch(QG_BASE + "/stop", { method: "POST", keepalive: true, headers: { "Content-Type": "application/json" }, body: "{}" });
+      } catch {}
+    });
+  })();
 
   // The layer viewers mostly get: the biggest active screen-share encoding.
   const mainScreenLayer = (snap) => snap?.sending.find((l) => l.screen && l.active) || null;
@@ -278,6 +1420,17 @@
   function diagnoseStreamHealth(snap) {
     const notes = [];
     const layer = mainScreenLayer(snap);
+    if (snap?.native) {
+      notes.push({
+        level: "info",
+        text: "Transmitindo pelo compartilhamento nativo do Micup (placa de vídeo, até 60 FPS). Para 90 ou 120 FPS, o Better MicUP usa o do Chromium.",
+      });
+    } else if (layer && snap.targetFps && snap.captureFps != null && snap.captureFps < snap.targetFps * 0.95) {
+      notes.push({
+        level: "warn",
+        text: `O Chromium liberou a captura a só ${formatFps(snap.captureFps)} (pedido: ${snap.targetFps} FPS).`,
+      });
+    }
     if (layer) {
       const target = snap.targetFps || null;
       const fps = layer.fps ?? 0;
@@ -329,6 +1482,12 @@
       if ((watching.lossPct ?? 0) >= 2) {
         notes.push({ level: "warn", text: `Sua internet está perdendo ${watching.lossPct}% dos pacotes do vídeo que você assiste.` });
       }
+      if (watching.smoothingMs) {
+        notes.push({
+          level: "info",
+          text: `Suavização ligada: ${watching.smoothingMs} ms de folga para os pacotes reenviados chegarem antes do quadro ser exibido.`,
+        });
+      }
     }
     return notes;
   }
@@ -348,7 +1507,8 @@
     return (
       streamHealth.listeners.size > 0 ||
       liveScreenShareTracks().length > 0 ||
-      !!state?.settings?.plugins?.ScreenShareBypass?.showStatsOverlay
+      !!state?.settings?.plugins?.ScreenShareBypass?.showStatsOverlay ||
+      (watchSmoothingMode() === "auto" && receivingVideo())
     );
   }
 
@@ -405,8 +1565,11 @@
         out: layer && [Math.round(layer.fps ?? 0), layer.width, layer.height, layer.kbps, layer.limit, layer.sourceFps == null ? null : Math.round(layer.sourceFps)],
         in: watching && [Math.round(watching.fps ?? 0), watching.width, watching.height, watching.kbps],
         up: snap.uplinkKbps,
+        cap: snap.captureFps == null ? null : Math.round(snap.captureFps),
+        native: snap.native || undefined,
       });
       if (streamHealth.history.length > 150) streamHealth.history.splice(0, streamHealth.history.length - 150);
+      tuneReceivers(snap);
       watchForTrouble(snap);
       renderStatsOverlay(snap);
       for (const fn of streamHealth.listeners) {
@@ -459,11 +1622,12 @@
       statsOverlayEl = null;
       return;
     }
-    if (!statsOverlayEl || !statsOverlayEl.isConnected) {
+    if (!statsOverlayEl) {
       statsOverlayEl = document.createElement("div");
       statsOverlayEl.className = "bmu-stats-overlay";
-      document.body.appendChild(statsOverlayEl);
     }
+    const overlayParent = floatingUiParent(); // inside the fullscreen element when there is one
+    if (statsOverlayEl.parentElement !== overlayParent) overlayParent.appendChild(statsOverlayEl);
     const rows = [];
     if (layer) {
       const warn = layer.limit !== "none" || (snap.targetFps && (layer.fps ?? 0) < snap.targetFps * 0.8);
@@ -590,6 +1754,9 @@
         // "sharp": keep the resolution, let the frame rate drop. "micup": Micup's own adaptation.
         priority: "smooth",
         maxBitrateKbps: "auto",
+        // Playout cushion for the videos you watch: "auto" (only when the link loses packets),
+        // "always" or "off".
+        smoothWatching: "auto",
         showStatsOverlay: false,
         unlockCamera1080p: true,
       },
@@ -620,6 +1787,12 @@
       VolumeBooster: {
         enabled: true,
         maxMultiplier: "200",
+      },
+      QualityGen: {
+        enabled: true,
+        engine: "auto", // "auto" | "builtin" | "qualitygen"
+        multiplier: "2",
+        showCounter: false,
       },
       FakePlus: {
         enabled: true,
@@ -700,6 +1873,13 @@
     applyThemesAndQuickCSS();
     notifyUI();
     renderStatsOverlay(streamHealth.last); // hides the meter right away when it was turned off
+    try {
+      tuneReceivers({ receiving: [] }); // "off"/"always" take effect at once
+    } catch {}
+    try {
+      if (frameGen.active && !frameGenEnabled()) stopFrameGen("disabled");
+      renderFrameGenButton();
+    } catch {}
     scheduleStreamHealth(0);
   }
 
@@ -1411,12 +2591,83 @@
           ],
         },
         {
+          key: "smoothWatching",
+          label: "Lives que você assiste",
+          type: "select",
+          options: [
+            {
+              value: "auto",
+              label: "Suavizar quando precisar",
+              description: "Recomendado. Se a sua internet perder pacotes, guarda 150 ms de vídeo de folga (até 300 ms se ainda travar) para não dar micro-travadas.",
+            },
+            {
+              value: "always",
+              label: "Sempre suavizar",
+              description: "Guarda 150 ms de folga o tempo todo. O vídeo fica um pouquinho atrás da voz.",
+            },
+            {
+              value: "off",
+              label: "Não mexer",
+              description: "Comportamento original do Micup: o menor atraso possível.",
+            },
+          ],
+        },
+        {
           key: "showStatsOverlay",
           label: "Medidor na tela",
           description: "Mostra no canto da tela o FPS, a resolução e o bitrate do que você transmite e do que você assiste.",
           type: "boolean",
         },
         { key: "streamHealth", label: "Agora", type: "health" },
+      ],
+    },
+    {
+      id: "QualityGen",
+      name: "Frame Gen",
+      category: "Voz e vídeo",
+      author: "Better MicUP",
+      description:
+        "Passe o mouse numa live e clique em \"FG\" (ao lado de \"1080p 60 FPS\"): gera quadros intermediários e uma live de 60 FPS aparece na taxa do seu monitor.",
+      settingsSchema: [
+        {
+          key: "engine",
+          label: "Motor",
+          type: "select",
+          options: [
+            {
+              value: "auto",
+              label: "Automático",
+              description: "Recomendado. Usa o Quality-Gen se ele estiver aberto; senão, o motor do próprio Better MicUP.",
+            },
+            {
+              value: "builtin",
+              label: "Better MicUP",
+              description: "Embutido, sem instalar nada. Usa a placa de vídeo pelo WebGPU e gera um quadro por atualização do monitor.",
+            },
+            {
+              value: "qualitygen",
+              label: "Quality-Gen",
+              description: "O app Quality-Gen (RIFE): melhor qualidade, precisa estar instalado e aberto.",
+            },
+          ],
+        },
+        {
+          key: "multiplier",
+          label: "Quadros na tela por quadro da live (Quality-Gen)",
+          type: "select",
+          options: [
+            { value: "2", label: "2x", description: "Recomendado. 60 FPS viram 120." },
+            { value: "3", label: "3x", description: "60 FPS viram 180. Para monitores de 165 Hz ou mais." },
+            { value: "4", label: "4x", description: "Mais artefatos em movimento rápido." },
+          ],
+        },
+        {
+          key: "showCounter",
+          label: "Contador do Quality-Gen no vídeo",
+          description: "Desligado, os números (quadros reais → na tela) aparecem no próprio botão FG.",
+          type: "boolean",
+        },
+        { key: "qualityGenStatus", label: "Quality-Gen", type: "qualitygen" },
       ],
     },
     {
@@ -2148,6 +3399,7 @@
     setTimeout(syncStoreBasedPlugins, 1800);
     setTimeout(syncStoreBasedPlugins, 8000); // stores found by shape may finish loading later
     scheduleStreamHealth(4000); // starts only if the on-screen meter is turned on
+    setTimeout(qgHandshake, 6000);
 
     // ------------------------------------------------------------------------
     // E. ScreenSharePlusBypass Hooks (`690261`, `477986`, `702223`, `857720`, `414298`)
@@ -3272,6 +4524,38 @@
       }
     });
 
+    // 7. Micup's native screen share (shell 1.0.20+, Windows + NVENC): a helper process captures
+    //    and encodes outside Chromium. The shell rejects any frame rate above 60 for it, so for
+    //    90/120 FPS the share has to stay on Chromium, where the hooks above apply.
+    const NATIVE_SHARE_MAX_FPS = 60;
+    Webpack.waitForExport(
+      (o) => typeof o === "object" && o !== null && typeof o.startNativeScreenShare === "function" && "nativeScreenShare" in o,
+      (engine) => {
+        nativeShareHost = engine;
+        const owner = Object.prototype.hasOwnProperty.call(engine, "startNativeScreenShare")
+          ? engine
+          : Object.getPrototypeOf(engine);
+        if (!owner || owner.startNativeScreenShare?.__miccordOrig) return;
+        Patcher.instead(
+          owner,
+          "startNativeScreenShare",
+          function (args, orig) {
+            const cfg = state.settings.plugins.ScreenShareBypass;
+            const requested = Number(args[1]?.resolution?.frameRate) || 0;
+            const wanted = cfg?.enabled ? Math.max(getDesiredScreenShareSpec().frameRate, requested) : requested;
+            // A native share already running is left alone (it is replaced the next time the
+            // share starts); starting a Chromium share beside it would publish the screen twice.
+            if (wanted > NATIVE_SHARE_MAX_FPS && !this?.nativeScreenShare?.active) {
+              recordScreenShareEvent("native-skipped", { fps: wanted });
+              return Promise.resolve(false);
+            }
+            return orig(...args);
+          },
+          "ScreenShareBypass_NativeFps"
+        );
+      }
+    );
+
     // ------------------------------------------------------------------------
     // E2. AlwaysTrustDomains: answer "trusted" to Micup's link check while the plugin is on, so
     //     external links open without the warning. Nothing is saved: turning the plugin off
@@ -3926,6 +5210,14 @@
         h(StreamHealthPanel)
       );
     }
+    if (field.type === "qualitygen") {
+      return h(
+        "div",
+        { className: "bmu-field" },
+        h("div", { className: "bmu-field-label" }, field.label),
+        h(QualityGenStatus)
+      );
+    }
     return null;
   }
 
@@ -4215,6 +5507,10 @@
     "publish-settings": "Stream configurado",
     "fps-low": "FPS do stream caiu",
     "stream-limited": "Stream limitado",
+    "native-skipped": "Usando o Chromium (FPS acima de 60)",
+    "watch-smoothing": "Suavização ligada na live que você assiste",
+    "framegen-on": "Frame Gen ligado (Quality-Gen)",
+    "framegen-off": "Frame Gen desligado",
   };
 
   function screenEventDetails(ev) {
@@ -4237,6 +5533,11 @@
       ]
         .filter(Boolean)
         .join(" · ");
+    }
+    if (ev.type === "native-skipped") return ev.fps ? `${ev.fps} FPS` : "";
+    if (ev.type === "watch-smoothing") {
+      const why = { loss: "perda de pacotes", freeze: "travada", keyframe: "quadro perdido", jitter: "oscilação" }[ev.reason] || ev.reason;
+      return [ev.targetMs && `${ev.targetMs} ms`, why, ev.lossPct != null && `${ev.lossPct}%`, ev.resolution].filter(Boolean).join(" · ");
     }
     if (ev.surface) return ev.surface === "window" ? "janela" : ev.surface;
     return "";
@@ -4279,10 +5580,11 @@
             stat("Upload estimado", formatMbps(snap.uplinkKbps)),
             stat(
               "Captura",
-              formatFps(layer.sourceFps),
+              formatFps(layer.sourceFps) + (snap.captureFps ? ` (teto ${Math.round(snap.captureFps)})` : ""),
               snap.targetFps && layer.sourceFps != null && layer.sourceFps < snap.targetFps * 0.8
             ),
             stat("Encoder", coder(layer), layer.hardware === false),
+            stat("Caminho", layer.native ? "nativo do Micup" : "Chromium"),
             stat("Limitado por", layer.limit === "none" ? "nada" : LIMIT_LABELS[layer.limit] || layer.limit, layer.limit !== "none"),
             stat("Ping", snap.rttMs == null ? "—" : `${snap.rttMs} ms`)
           )
@@ -4300,6 +5602,8 @@
             stat("Bitrate", formatMbps(watching.kbps)),
             stat("Quadros perdidos", `${Math.round(watching.droppedPerSec ?? 0)}/s`, (watching.droppedPerSec ?? 0) >= 3),
             stat("Perda de pacotes", watching.lossPct == null ? "—" : `${watching.lossPct}%`, (watching.lossPct ?? 0) >= 2),
+            stat("Folga do vídeo", watching.bufferMs == null ? "—" : `${watching.bufferMs} ms`),
+            stat("Suavização", watching.smoothingMs ? `ligada (${watching.smoothingMs} ms)` : "desligada"),
             stat("Decoder", coder(watching), watching.hardware === false)
           )
         ),
@@ -4309,6 +5613,26 @@
           { className: "bmu-health-notes" },
           notes.map((n, i) => h("li", { key: i, className: "is-" + n.level }, n.text))
         )
+    );
+  }
+
+  // Whether the Quality-Gen app answers on 127.0.0.1 (Frame Gen plugin options).
+  function QualityGenStatus() {
+    const React = getReact();
+    const [, bump] = React.useReducer((x) => x + 1, 0);
+    React.useEffect(() => {
+      qgCheck().then(bump);
+    }, []);
+    const s = qualityGen.status;
+    const text = qualityGen.available
+      ? `Conectado ao Quality-Gen ${s?.version || ""}` +
+        (s?.micup ? ", gerando quadros numa live agora." : s?.busy ? ", ocupado gerando quadros em outra janela." : ".")
+      : "Quality-Gen não encontrado: o FG usa o motor do próprio Better MicUP. Para a qualidade do Quality-Gen, abra o app e clique em verificar.";
+    return h(
+      "div",
+      { className: "bmu-health" },
+      h("ul", { className: "bmu-health-notes" }, h("li", { className: qualityGen.available ? "is-ok" : "is-warn" }, text)),
+      h(Actions, null, h(Button, { onClick: () => qgCheck().then(bump) }, "Verificar de novo"))
     );
   }
 
@@ -4871,6 +6195,7 @@
     // Números ao vivo do stream (o mesmo relatório do botão "Copiar relatório")
     streamHealth: streamHealthReport,
     collectStreamHealth,
+    qualityGen: { state: qualityGen, check: qgCheck, request: qgRequest },
     inspectCallView,
     saveSettings,
     showToast,
