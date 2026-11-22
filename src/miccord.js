@@ -15,7 +15,7 @@
   if (window.__MICCORD_INITIALIZED__) return;
   window.__MICCORD_INITIALIZED__ = true;
 
-  const VERSION = "1.0.9";
+  const VERSION = "1.0.10";
   const STORAGE_KEY = "miccord_settings_v1";
   const MSGLOG_KEY = "miccord_message_logs_v1";
   const SS_EVENTS_KEY = "miccord_screenshare_events_v1";
@@ -850,99 +850,37 @@
   // </fg-engine>
 
   // --------------------------------------------------------------------------
-  // Quality-Gen bridge. Quality-Gen (a separate Windows app: frame generation + upscaling,
-  // captures a window and draws an overlay) listens on 127.0.0.1. Micup's CSP allows
-  // connect-src http://127.0.0.1:*, which is the only way out of the renderer sandbox.
+  // Frame Gen. Hover a live you are watching and a pill shows up next to Micup's own
+  // ("1080p 60 FPS · LIVE"): FG on/off and how many frames per real frame (2x, 3x, 4x or Máx,
+  // one per display refresh). It hides again when the mouse leaves. The engine (FgEngine above)
+  // runs on the GPU through WebGPU and draws on a canvas laid exactly over the picture.
   // --------------------------------------------------------------------------
-  const QG_BASE = "http://127.0.0.1:47615/v1";
-  const qualityGen = { available: false, checkedAt: 0, status: null, lastError: null };
-
-  async function qgRequest(path, body, timeoutMs = 2000) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      const init = body === undefined
-        ? { signal: ctrl.signal, cache: "no-store" }
-        : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal, cache: "no-store" };
-      const res = await fetch(QG_BASE + path, init);
-      let data = {};
-      try {
-        data = await res.json();
-      } catch {}
-      if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
-      return data;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async function qgCheck() {
-    try {
-      const status = await qgRequest("/status");
-      qualityGen.available = status?.app === "Quality-Gen";
-      qualityGen.status = status;
-      qualityGen.lastError = null;
-    } catch (e) {
-      qualityGen.available = false;
-      qualityGen.lastError = String(e?.message || e);
-    }
-    qualityGen.checkedAt = Date.now();
-    return qualityGen.available;
-  }
-
-  // Handshake when Micup opens: tells Quality-Gen which Micup/mod is talking to it.
-  async function qgHandshake() {
-    if (!(await qgCheck())) {
-      Logger.info("Quality-Gen não encontrado:", qualityGen.lastError);
-      return;
-    }
-    try {
-      const hello = await qgRequest("/hello", { client: "better-micup", version: VERSION });
-      Logger.info("Quality-Gen conectado:", qualityGen.status, hello);
-    } catch (e) {
-      qualityGen.lastError = String(e?.message || e);
-      Logger.warn("Quality-Gen respondeu ao status, mas não ao comando:", qualityGen.lastError);
-    }
-  }
-
-  // --------------------------------------------------------------------------
-  // Frame Gen button: hover a live you are watching and click "FG". Two engines:
-  //  - built-in (FgEngine above): WebGPU, a canvas drawn exactly over the picture, one new frame
-  //    per display refresh. Works for everyone with the update, nothing to install.
-  //  - Quality-Gen (the separate app, RIFE): generates frames over just that video (overlay 1:1
-  //    on the Micup window, click-through). Used when it is open, or when chosen.
-  // --------------------------------------------------------------------------
+  const FG_MULTIPLIERS = ["2", "3", "4", "max"];
+  const FG_HIDE_AFTER_MS = 1200;
   const frameGen = {
     active: false,
     starting: false,
-    mode: null, // "qg" | "builtin" while on
     video: null,
-    cropKey: null,
-    pendingCrop: null,
-    pendingSince: 0,
-    button: null,
-    hovered: null,
+    trackId: null,
+    missingSince: 0,
+    pill: null,
+    hovered: null, // live under the mouse (when FG is off)
+    lastHoverAt: 0,
+    hideTimer: null,
     watchTimer: null,
     builtin: null,
   };
 
-  const frameGenSettings = () => state?.settings?.plugins?.QualityGen || {};
+  const frameGenSettings = () => state?.settings?.plugins?.FrameGen || {};
   const frameGenEnabled = () => !!frameGenSettings().enabled;
-  const frameGenMultiplier = () => Math.min(4, Math.max(2, Number(frameGenSettings().multiplier) || 2));
-  const frameGenEngineChoice = () => {
-    const e = frameGenSettings().engine;
-    return e === "builtin" || e === "qualitygen" ? e : "auto";
+  const frameGenMultiplier = () => {
+    const m = String(frameGenSettings().multiplier || "max");
+    return FG_MULTIPLIERS.includes(m) ? m : "max";
   };
-  const builtinFgAvailable = () =>
+  const multiplierLabel = (m) => (m === "max" ? "Máx" : `${m}x`);
+  const frameGenAvailable = () =>
     typeof navigator !== "undefined" && !!navigator.gpu && typeof HTMLVideoElement !== "undefined" &&
     "requestVideoFrameCallback" in HTMLVideoElement.prototype;
-  // The engine a click would use right now (null: none available).
-  function frameGenModeNow() {
-    const e = frameGenEngineChoice();
-    if (e === "qualitygen") return qualityGen.available ? "qg" : null;
-    if (e === "builtin") return builtinFgAvailable() ? "builtin" : null;
-    return qualityGen.available ? "qg" : builtinFgAvailable() ? "builtin" : null;
-  }
 
   // Videos of other people (screen shares and cameras big enough to be worth it).
   function watchableVideos() {
@@ -977,64 +915,72 @@
     return fs && !(fs instanceof HTMLVideoElement) ? fs : document.body;
   };
 
-  // The picture inside the <video> box (object-fit contain leaves bars), clipped to the window.
-  function videoPictureRect(v) {
-    const r = v.getBoundingClientRect();
-    let left = r.left, top = r.top, right = r.right, bottom = r.bottom;
-    const fit = getComputedStyle(v).objectFit;
-    if (fit !== "fill" && fit !== "cover" && v.videoWidth && v.videoHeight) {
-      const scale = Math.min(r.width / v.videoWidth, r.height / v.videoHeight);
-      const w = v.videoWidth * scale;
-      const h = v.videoHeight * scale;
-      left = r.left + (r.width - w) / 2;
-      top = r.top + (r.height - h) / 2;
-      right = left + w;
-      bottom = top + h;
+  // ---- the pill
+  function setFgMultiplier(m) {
+    const cfg = state.settings.plugins.FrameGen;
+    if (!cfg || cfg.multiplier === m) return;
+    cfg.multiplier = m;
+    saveSettings();
+  }
+
+  function ensureFgPill() {
+    if (frameGen.pill) return frameGen.pill;
+    const pill = document.createElement("div");
+    pill.className = "bmu-fg-pill";
+    pill.setAttribute("role", "group");
+    pill.setAttribute("aria-label", "Frame Gen");
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "bmu-fg-toggle";
+    const dot = document.createElement("span");
+    dot.className = "bmu-fg-dot";
+    toggle.append(dot, "FG");
+    const seg = document.createElement("div");
+    seg.className = "bmu-fg-seg";
+    for (const m of FG_MULTIPLIERS) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.dataset.m = m;
+      b.textContent = multiplierLabel(m);
+      b.title = m === "max" ? "Um quadro novo a cada atualização do monitor (o mais liso)" : `${m} quadros na tela para cada quadro da live`;
+      seg.appendChild(b);
     }
-    return {
-      left: Math.max(0, left),
-      top: Math.max(0, top),
-      right: Math.min(window.innerWidth, right),
-      bottom: Math.min(window.innerHeight, bottom),
-    };
-  }
-
-  // Crop in physical pixels of the window's client area (what Quality-Gen captures).
-  function frameGenCrop(v) {
-    const dpr = window.devicePixelRatio || 1;
-    const p = videoPictureRect(v);
-    return {
-      left: Math.ceil(p.left * dpr),
-      top: Math.ceil(p.top * dpr),
-      right: Math.ceil((window.innerWidth - p.right) * dpr),
-      bottom: Math.ceil((window.innerHeight - p.bottom) * dpr),
-    };
-  }
-
-  const cropKeyOf = (c) => `${c.left},${c.top},${c.right},${c.bottom}`;
-  // The numbers go on the FG button; Quality-Gen's own counter would sit on the picture.
-  const frameGenStartBody = (crop) => ({ crop, multiplier: frameGenMultiplier(), showFps: !!frameGenSettings().showCounter });
-
-  // One button for the whole session; renderFrameGenButton puts it in the page or in the
-  // fullscreen element (and back when that element goes away with it inside).
-  function ensureFrameGenButton() {
-    if (frameGen.button) return frameGen.button;
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "bmu-fg-btn";
-    b.addEventListener("click", (ev) => {
+    const stats = document.createElement("span");
+    stats.className = "bmu-fg-stats";
+    pill.append(toggle, seg, stats);
+    // Keep Micup's tile handlers (focus the stream, open the player) out of our clicks.
+    for (const type of ["pointerdown", "mousedown", "click", "dblclick"]) {
+      pill.addEventListener(type, (ev) => ev.stopPropagation());
+    }
+    toggle.addEventListener("click", (ev) => {
       ev.preventDefault();
-      ev.stopPropagation();
       if (frameGen.active || frameGen.starting) stopFrameGen("button");
       else if (frameGen.hovered) startFrameGen(frameGen.hovered);
     });
-    document.body.appendChild(b);
-    frameGen.button = b;
-    return b;
+    seg.addEventListener("click", (ev) => {
+      const m = ev.target?.dataset?.m;
+      if (!m) return;
+      ev.preventDefault();
+      setFgMultiplier(m);
+      if (!frameGen.active && !frameGen.starting && frameGen.hovered) startFrameGen(frameGen.hovered);
+      renderFgPill();
+    });
+    pill.addEventListener("pointerenter", () => {
+      frameGen.overPill = true;
+      frameGen.lastHoverAt = Date.now();
+      renderFgPill();
+    });
+    pill.addEventListener("pointerleave", () => {
+      frameGen.overPill = false;
+      frameGen.lastHoverAt = Date.now();
+      scheduleFgPillHide();
+    });
+    frameGen.pill = pill;
+    return pill;
   }
 
-  // Micup's own stream pill on the tile ("1080p 60 FPS · LIVE", top right). The FG button sits
-  // just left of it, so it reads as part of the stream info and stays off the picture's content.
+  // Micup's own stream pill on the tile ("1080p 60 FPS · LIVE", top right). Ours sits just left of
+  // it, so it reads as part of the stream info and stays off the picture's content.
   const STREAM_PILL = '[data-flx="voice.stream-info-pill.container"], [data-flx="voice.stream-info-pill.pill"]';
   function frameGenAnchor(video) {
     let el = video.parentElement;
@@ -1050,54 +996,56 @@
     return { right: vr.right - 8, centerY: vr.top + 19 };
   }
 
-  function frameGenLabel() {
-    const mode = frameGen.active || frameGen.starting ? frameGen.mode : frameGenModeNow();
-    const label = mode === "qg" ? `FG ${frameGenMultiplier()}x` : "FG";
-    if (frameGen.starting) return `${label} …`;
-    if (frameGen.active && mode === "builtin") {
-      const b = frameGen.builtin;
-      return b?.realFps > 0 ? `${label} · ${Math.round(b.realFps)}→${Math.round(b.shownFps)}` : `${label} ●`;
-    }
-    const s = qualityGen.status;
-    if (frameGen.active && s?.micup && s.realFps > 0) {
-      return `${label} · ${Math.round(s.realFps)}→${Math.round(s.realFps + (s.generatedFps || 0))}`;
-    }
-    return frameGen.active ? `${label} ●` : label;
+  function scheduleFgPillHide() {
+    clearTimeout(frameGen.hideTimer);
+    frameGen.hideTimer = setTimeout(renderFgPill, FG_HIDE_AFTER_MS + 30);
   }
 
-  function renderFrameGenButton() {
+  function renderFgPill() {
     const target = frameGen.active || frameGen.starting ? frameGen.video : frameGen.hovered;
-    const usable = frameGen.active || frameGen.starting || frameGenModeNow() != null;
-    if (!frameGenEnabled() || !usable || !target || !target.isConnected) {
-      if (frameGen.button) frameGen.button.style.display = "none";
+    if (!frameGenEnabled() || !frameGenAvailable() || !target || !target.isConnected) {
+      if (frameGen.pill) frameGen.pill.style.display = "none";
       return;
     }
-    const b = ensureFrameGenButton();
+    const pill = ensureFgPill();
     const parent = floatingUiParent();
-    if (b.parentElement !== parent) parent.appendChild(b);
-    const mode = frameGen.active || frameGen.starting ? frameGen.mode : frameGenModeNow();
-    b.textContent = frameGenLabel();
-    b.classList.toggle("is-on", frameGen.active);
-    b.title = frameGen.active
-      ? `${mode === "qg" ? "Quality-Gen" : "Better MicUP"} gerando quadros nesta live (quadros reais → na tela). Clique para desligar.`
-      : mode === "qg"
-        ? `Assistir esta live com ${frameGenMultiplier()}x mais quadros (Quality-Gen).`
-        : "Assistir esta live com quadros gerados até a taxa do seu monitor.";
-    b.style.display = "block";
+    if (pill.parentElement !== parent) parent.appendChild(pill);
+    const m = frameGenMultiplier();
+    pill.classList.toggle("is-on", frameGen.active);
+    pill.classList.toggle("is-starting", frameGen.starting);
+    const toggle = pill.querySelector(".bmu-fg-toggle");
+    toggle.setAttribute("aria-pressed", String(frameGen.active));
+    toggle.title = frameGen.active ? "Desligar o Frame Gen" : "Ligar o Frame Gen nesta live";
+    for (const b of pill.querySelectorAll(".bmu-fg-seg button")) {
+      const on = b.dataset.m === m;
+      b.classList.toggle("is-selected", on);
+      b.setAttribute("aria-pressed", String(on));
+    }
+    const stats = pill.querySelector(".bmu-fg-stats");
+    const st = frameGen.builtin;
+    const text = frameGen.active && st?.realFps > 0 ? `${Math.round(st.realFps)}→${Math.round(st.shownFps)}` : "";
+    stats.textContent = text;
+    stats.style.display = text ? "" : "none";
+    stats.title = text ? "Quadros da live → quadros na tela, por segundo" : "";
+    // visible while the mouse is on the live (or on the pill), then fades out
+    const visible = frameGen.overPill || Date.now() - frameGen.lastHoverAt < FG_HIDE_AFTER_MS;
+    pill.style.display = "flex";
+    pill.classList.toggle("is-visible", visible);
     const a = frameGenAnchor(target);
-    b.style.left = `${Math.round(Math.max(4, a.right - b.offsetWidth))}px`;
-    b.style.top = `${Math.round(Math.max(4, a.centerY - b.offsetHeight / 2))}px`;
+    pill.style.left = `${Math.round(Math.max(4, a.right - pill.offsetWidth))}px`;
+    pill.style.top = `${Math.round(Math.max(4, a.centerY - pill.offsetHeight / 2))}px`;
+    if (visible) scheduleFgPillHide();
   }
 
-  // ---- built-in engine: a canvas over the picture, fed by the video's frames
+  // ---- the engine: a canvas over the picture, fed by the video's frames
   function placeFgCanvas(st) {
     const { canvas, video, engine } = st;
-    if (!video.isConnected) return;
+    if (!video.isConnected) return false;
     if (canvas.previousElementSibling !== video) video.insertAdjacentElement("afterend", canvas);
     const r = video.getBoundingClientRect();
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    if (!r.width || !r.height || !vw || !vh) return;
+    if (!r.width || !r.height || !vw || !vh) return false;
     const fit = getComputedStyle(video).objectFit;
     let pic = { left: r.left, top: r.top, width: r.width, height: r.height };
     let crop = [0, 0, 1, 1];
@@ -1127,7 +1075,9 @@
     if (canvas.width !== cw || canvas.height !== ch) {
       canvas.width = cw;
       canvas.height = ch;
+      return true; // resized: the canvas was cleared, draw again
     }
+    return false;
   }
 
   async function startBuiltinFg(video) {
@@ -1143,7 +1093,7 @@
       canvas.remove();
       throw e;
     }
-    const st = { engine, canvas, video, segStart: 0, interval: 1000 / 60, lastArrival: 0, real: 0, drawn: 0, statAt: performance.now(), realFps: 0, shownFps: 0, raf: 0, vfc: 0, n: 0, stopped: false };
+    const st = { engine, canvas, video, segStart: 0, interval: 1000 / 60, lastArrival: 0, real: 0, drawn: 0, statAt: performance.now(), realFps: 0, shownFps: 0, raf: 0, vfc: 0, n: 0, lastKey: "", redraw: true, stopped: false };
     frameGen.builtin = st;
     placeFgCanvas(st);
     // each real frame: copy + flow; then show it one frame late, filling the gap with in-betweens
@@ -1170,7 +1120,7 @@
       st.video = next;
       next.insertAdjacentElement("afterend", st.canvas);
       st.vfc = next.requestVideoFrameCallback(onFrame);
-      placeFgCanvas(st);
+      st.redraw = placeFgCanvas(st) || true;
     };
     st.vfc = video.requestVideoFrameCallback(onFrame);
     const loop = (now) => {
@@ -1180,11 +1130,26 @@
         showToast("A placa de vídeo interrompeu o Frame Gen. Clique em FG para tentar de novo.", "error");
         return;
       }
-      if (st.n++ % 10 === 0) placeFgCanvas(st);
-      try {
-        if (engine.draw((now - st.segStart) / st.interval)) st.drawn++;
-      } catch (e) {
-        Logger.warn("Frame Gen: falha ao desenhar:", e);
+      if (st.n++ % 10 === 0 && placeFgCanvas(st)) st.redraw = true;
+      // Máx: a new in-between at every display refresh. 2x/3x/4x: that many frames per real
+      // frame (t in steps of 1/n), drawing only when the step changes.
+      const m = frameGenMultiplier();
+      let t = Math.min(1, Math.max(0, (now - st.segStart) / st.interval));
+      if (m !== "max") {
+        const n = Number(m);
+        t = Math.min(1, Math.floor(t * n + 1e-6) / n);
+      }
+      const key = `${st.segStart}:${t}`;
+      if (key !== st.lastKey || st.redraw) {
+        try {
+          if (engine.draw(t)) {
+            st.drawn++;
+            st.lastKey = key;
+            st.redraw = false;
+          }
+        } catch (e) {
+          Logger.warn("Frame Gen: falha ao desenhar:", e);
+        }
       }
       if (now - st.statAt >= 1000) {
         st.realFps = (st.real * 1000) / (now - st.statAt);
@@ -1192,7 +1157,7 @@
         st.real = 0;
         st.drawn = 0;
         st.statAt = now;
-        renderFrameGenButton();
+        renderFgPill();
       }
       st.raf = requestAnimationFrame(loop);
     };
@@ -1215,75 +1180,43 @@
   }
 
   async function startFrameGen(video) {
-    if (frameGen.starting) return;
-    const mode = frameGenModeNow();
-    if (!mode) return;
+    if (frameGen.starting || frameGen.active || !frameGenAvailable()) return;
     frameGen.starting = true;
-    frameGen.mode = mode;
     frameGen.video = video;
     frameGen.trackId = videoTrackId(video);
     frameGen.missingSince = 0;
-    renderFrameGenButton();
+    renderFgPill();
     try {
-      if (mode === "builtin") {
-        await startBuiltinFg(video);
-      } else {
-        const crop = frameGenCrop(video);
-        frameGen.lastStartAt = Date.now();
-        await qgRequest("/start", frameGenStartBody(crop), 5000);
-        frameGen.cropKey = cropKeyOf(crop);
-      }
+      await startBuiltinFg(video);
       frameGen.active = true;
       recordScreenShareEvent("framegen-on", {
-        engine: mode === "qg" ? "Quality-Gen" : "embutido",
-        multiplier: mode === "qg" ? frameGenMultiplier() : null,
+        multiplier: multiplierLabel(frameGenMultiplier()),
         size: `${video.videoWidth}×${video.videoHeight}`,
       });
       watchFrameGen();
     } catch (e) {
-      const msg = String(e?.message || e);
       frameGen.video = null;
-      frameGen.mode = null;
-      showToast(
-        mode === "builtin"
-          ? `Não deu para ligar o Frame Gen: ${msg}`
-          : msg === "busy"
-            ? "O Quality-Gen já está gerando quadros em outra janela."
-            : msg.includes("micup window")
-              ? "O Quality-Gen não achou a janela do Micup."
-              : `Não deu para ligar o Quality-Gen: ${msg}`,
-        "error"
-      );
+      frameGen.trackId = null;
+      showToast(`Não deu para ligar o Frame Gen: ${String(e?.message || e)}`, "error");
     } finally {
       frameGen.starting = false;
-      renderFrameGenButton();
+      renderFgPill();
     }
   }
 
-  async function stopFrameGen(reason) {
+  function stopFrameGen(reason) {
     const wasActive = frameGen.active;
-    const mode = frameGen.mode;
     frameGen.active = false;
     frameGen.video = null;
-    frameGen.mode = null;
     frameGen.trackId = null;
-    frameGen.cropKey = null;
-    frameGen.pendingCrop = null;
     clearInterval(frameGen.watchTimer);
     frameGen.watchTimer = null;
-    if (mode === "builtin") stopBuiltinFg();
-    renderFrameGenButton();
-    if (!wasActive) return;
-    recordScreenShareEvent("framegen-off", { reason });
-    if (mode === "qg") {
-      try {
-        await qgRequest("/stop", {});
-      } catch {}
-    }
+    stopBuiltinFg();
+    renderFgPill();
+    if (wasActive) recordScreenShareEvent("framegen-off", { reason });
   }
 
-  // While on: stop when the live goes away. Quality-Gen also needs the crop re-sent when the
-  // layout changes (the built-in canvas follows the video by itself).
+  // While on: follow the live to whichever player shows it, stop when it goes away.
   function watchFrameGen() {
     clearInterval(frameGen.watchTimer);
     frameGen.watchTimer = setInterval(() => {
@@ -1299,71 +1232,27 @@
       frameGen.missingSince = 0;
       if (best !== frameGen.video) {
         frameGen.video = best;
-        if (frameGen.mode === "builtin") frameGen.builtin?.attach(best);
+        frameGen.builtin?.attach(best);
       }
-      const v = frameGen.video;
-      if (frameGen.mode !== "qg") {
-        renderFrameGenButton();
-        return;
-      }
-      frameGen.tick = (frameGen.tick || 0) + 1;
-      if (frameGen.tick % 3 === 0) {
-        qgCheck().then(() => {
-          // Stopped from Quality-Gen itself (its hotkey or window): reflect it here. A restart
-          // for a new crop also passes through "stopped" for a moment, so wait for two polls.
-          const s = qualityGen.status;
-          const stoppedThere = qualityGen.available && s && !s.micup && s.state === "stopped" && !frameGen.starting && Date.now() - (frameGen.lastStartAt || 0) > 3000;
-          frameGen.stoppedPolls = stoppedThere ? (frameGen.stoppedPolls || 0) + 1 : 0;
-          if (frameGen.active && frameGen.mode === "qg" && frameGen.stoppedPolls >= 2) {
-            frameGen.stoppedPolls = 0;
-            frameGen.active = false;
-            frameGen.video = null;
-            frameGen.mode = null;
-            clearInterval(frameGen.watchTimer);
-            frameGen.watchTimer = null;
-            recordScreenShareEvent("framegen-off", { reason: "stopped-in-quality-gen" });
-          }
-          renderFrameGenButton();
-        });
-      }
-      renderFrameGenButton();
-      const crop = frameGenCrop(v);
-      const key = cropKeyOf(crop);
-      if (key === frameGen.cropKey) {
-        frameGen.pendingCrop = null;
-        return;
-      }
-      if (frameGen.pendingCrop !== key) {
-        frameGen.pendingCrop = key;
-        frameGen.pendingSince = Date.now();
-        return;
-      }
-      if (Date.now() - frameGen.pendingSince < 600 || frameGen.starting) return;
-      frameGen.cropKey = key;
-      frameGen.pendingCrop = null;
-      frameGen.lastStartAt = Date.now();
-      qgRequest("/start", frameGenStartBody(crop), 5000).catch((e) => {
-        Logger.warn("Quality-Gen não aceitou o novo recorte:", e);
-        stopFrameGen("restart-failed");
-      });
+      renderFgPill();
     }, 400);
   }
 
   function frameGenPointer(ev) {
-    if (!frameGenEnabled() || frameGen.active || frameGen.starting) return;
-    if (ev.target === frameGen.button) return;
+    if (!frameGenEnabled() || !frameGenAvailable()) return;
+    if (frameGen.pill && frameGen.pill.contains(ev.target)) return; // handled by pointerenter
     const hit = watchableVideos().find((v) => {
       const r = v.getBoundingClientRect();
       return ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom;
     }) || null;
-    if (hit !== frameGen.hovered) {
+    if (!hit) return; // leaving: the pill fades out by itself
+    if (frameGen.active || frameGen.starting) {
+      if (videoTrackId(hit) !== frameGen.trackId) return; // another live while FG is on: leave it
+    } else {
       frameGen.hovered = hit;
-      // Quality-Gen opened after Micup: look again when a live is hovered (at most every 10 s)
-      if (hit && !qualityGen.available && Date.now() - qualityGen.checkedAt > 10000) {
-        qgCheck().then(renderFrameGenButton);
-      }
-      renderFrameGenButton();
     }
+    frameGen.lastHoverAt = Date.now();
+    renderFgPill();
   }
 
   (function installFrameGen() {
@@ -1390,21 +1279,14 @@
             const best = bestVideoForTrack(frameGen.trackId);
             if (best && best !== frameGen.video) {
               frameGen.video = best;
-              if (frameGen.mode === "builtin") frameGen.builtin?.attach(best);
+              frameGen.builtin?.attach(best);
             }
-            if (frameGen.builtin) placeFgCanvas(frameGen.builtin);
+            if (frameGen.builtin && placeFgCanvas(frameGen.builtin)) frameGen.builtin.redraw = true;
           }
-          renderFrameGenButton();
+          renderFgPill();
           renderStatsOverlay(streamHealth.last);
         } catch {}
       }, 50);
-    });
-    // Micup closing or reloading: don't leave the overlay over a window that is gone.
-    window.addEventListener("pagehide", () => {
-      if (!frameGen.active || frameGen.mode !== "qg") return;
-      try {
-        fetch(QG_BASE + "/stop", { method: "POST", keepalive: true, headers: { "Content-Type": "application/json" }, body: "{}" });
-      } catch {}
     });
   })();
 
@@ -1736,7 +1618,7 @@
   // 1. Persistent Configuration & State Management
   // ==========================================================================
   // Bump when a saved setting needs migrating (see loadSettings).
-  const SETTINGS_REVISION = 2;
+  const SETTINGS_REVISION = 3;
 
   const DEFAULT_SETTINGS = {
     settingsRevision: SETTINGS_REVISION,
@@ -1788,11 +1670,9 @@
         enabled: true,
         maxMultiplier: "200",
       },
-      QualityGen: {
+      FrameGen: {
         enabled: true,
-        engine: "auto", // "auto" | "builtin" | "qualitygen"
-        multiplier: "2",
-        showCounter: false,
+        multiplier: "max", // "2" | "3" | "4" | "max" (one frame per display refresh)
       },
       FakePlus: {
         enabled: true,
@@ -1841,6 +1721,14 @@
       if (ss.maxBitrateKbps === "12000") ss.maxBitrateKbps = "auto";
     }
     if (ss) delete ss.disableEncoderThrottling;
+    // 1.0.9 called the plugin QualityGen (it could also drive the Quality-Gen app)
+    const oldFg = saved.plugins?.QualityGen;
+    if (revision < 3 && oldFg && merged.plugins.FrameGen) {
+      if (typeof oldFg.enabled === "boolean") merged.plugins.FrameGen.enabled = oldFg.enabled;
+      if (["2", "3", "4"].includes(String(oldFg.multiplier)) && String(oldFg.multiplier) !== "2") {
+        merged.plugins.FrameGen.multiplier = String(oldFg.multiplier); // "2" was only the old default
+      }
+    }
     merged.settingsRevision = SETTINGS_REVISION;
   }
 
@@ -1878,7 +1766,7 @@
     } catch {}
     try {
       if (frameGen.active && !frameGenEnabled()) stopFrameGen("disabled");
-      renderFrameGenButton();
+      renderFgPill();
     } catch {}
     scheduleStreamHealth(0);
   }
@@ -2622,52 +2510,24 @@
       ],
     },
     {
-      id: "QualityGen",
+      id: "FrameGen",
       name: "Frame Gen",
       category: "Voz e vídeo",
       author: "Better MicUP",
       description:
-        "Passe o mouse numa live e clique em \"FG\" (ao lado de \"1080p 60 FPS\"): gera quadros intermediários e uma live de 60 FPS aparece na taxa do seu monitor.",
+        "Passe o mouse numa live: ao lado de \"1080p 60 FPS\" aparece o FG. Ele gera quadros intermediários na sua placa de vídeo e a live fica mais lisa. Dá para escolher 2x, 3x, 4x ou Máx ali mesmo.",
       settingsSchema: [
         {
-          key: "engine",
-          label: "Motor",
-          type: "select",
-          options: [
-            {
-              value: "auto",
-              label: "Automático",
-              description: "Recomendado. Usa o Quality-Gen se ele estiver aberto; senão, o motor do próprio Better MicUP.",
-            },
-            {
-              value: "builtin",
-              label: "Better MicUP",
-              description: "Embutido, sem instalar nada. Usa a placa de vídeo pelo WebGPU e gera um quadro por atualização do monitor.",
-            },
-            {
-              value: "qualitygen",
-              label: "Quality-Gen",
-              description: "O app Quality-Gen (RIFE): melhor qualidade, precisa estar instalado e aberto.",
-            },
-          ],
-        },
-        {
           key: "multiplier",
-          label: "Quadros na tela por quadro da live (Quality-Gen)",
+          label: "Quadros na tela por quadro da live",
           type: "select",
           options: [
-            { value: "2", label: "2x", description: "Recomendado. 60 FPS viram 120." },
-            { value: "3", label: "3x", description: "60 FPS viram 180. Para monitores de 165 Hz ou mais." },
-            { value: "4", label: "4x", description: "Mais artefatos em movimento rápido." },
+            { value: "max", label: "Máx", description: "Recomendado. Um quadro novo a cada atualização do monitor: o mais liso." },
+            { value: "2", label: "2x", description: "60 FPS viram 120. Mais leve para a placa de vídeo." },
+            { value: "3", label: "3x", description: "60 FPS viram 180." },
+            { value: "4", label: "4x", description: "60 FPS viram 240." },
           ],
         },
-        {
-          key: "showCounter",
-          label: "Contador do Quality-Gen no vídeo",
-          description: "Desligado, os números (quadros reais → na tela) aparecem no próprio botão FG.",
-          type: "boolean",
-        },
-        { key: "qualityGenStatus", label: "Quality-Gen", type: "qualitygen" },
       ],
     },
     {
@@ -3399,7 +3259,6 @@
     setTimeout(syncStoreBasedPlugins, 1800);
     setTimeout(syncStoreBasedPlugins, 8000); // stores found by shape may finish loading later
     scheduleStreamHealth(4000); // starts only if the on-screen meter is turned on
-    setTimeout(qgHandshake, 6000);
 
     // ------------------------------------------------------------------------
     // E. ScreenSharePlusBypass Hooks (`690261`, `477986`, `702223`, `857720`, `414298`)
@@ -5210,14 +5069,6 @@
         h(StreamHealthPanel)
       );
     }
-    if (field.type === "qualitygen") {
-      return h(
-        "div",
-        { className: "bmu-field" },
-        h("div", { className: "bmu-field-label" }, field.label),
-        h(QualityGenStatus)
-      );
-    }
     return null;
   }
 
@@ -5509,7 +5360,7 @@
     "stream-limited": "Stream limitado",
     "native-skipped": "Usando o Chromium (FPS acima de 60)",
     "watch-smoothing": "Suavização ligada na live que você assiste",
-    "framegen-on": "Frame Gen ligado (Quality-Gen)",
+    "framegen-on": "Frame Gen ligado",
     "framegen-off": "Frame Gen desligado",
   };
 
@@ -5613,26 +5464,6 @@
           { className: "bmu-health-notes" },
           notes.map((n, i) => h("li", { key: i, className: "is-" + n.level }, n.text))
         )
-    );
-  }
-
-  // Whether the Quality-Gen app answers on 127.0.0.1 (Frame Gen plugin options).
-  function QualityGenStatus() {
-    const React = getReact();
-    const [, bump] = React.useReducer((x) => x + 1, 0);
-    React.useEffect(() => {
-      qgCheck().then(bump);
-    }, []);
-    const s = qualityGen.status;
-    const text = qualityGen.available
-      ? `Conectado ao Quality-Gen ${s?.version || ""}` +
-        (s?.micup ? ", gerando quadros numa live agora." : s?.busy ? ", ocupado gerando quadros em outra janela." : ".")
-      : "Quality-Gen não encontrado: o FG usa o motor do próprio Better MicUP. Para a qualidade do Quality-Gen, abra o app e clique em verificar.";
-    return h(
-      "div",
-      { className: "bmu-health" },
-      h("ul", { className: "bmu-health-notes" }, h("li", { className: qualityGen.available ? "is-ok" : "is-warn" }, text)),
-      h(Actions, null, h(Button, { onClick: () => qgCheck().then(bump) }, "Verificar de novo"))
     );
   }
 
@@ -6195,7 +6026,6 @@
     // Números ao vivo do stream (o mesmo relatório do botão "Copiar relatório")
     streamHealth: streamHealthReport,
     collectStreamHealth,
-    qualityGen: { state: qualityGen, check: qgCheck, request: qgRequest },
     inspectCallView,
     saveSettings,
     showToast,

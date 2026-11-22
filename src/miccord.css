@@ -1105,33 +1105,128 @@ html[data-miccord-theme="midnight"] button[class*="Button_module__button"][class
   color: #f0b232;
 }
 
-/* Frame Gen button, next to Micup's stream pill ("1080p 60 FPS · LIVE") on a live tile */
-.bmu-fg-btn {
+/* Frame Gen pill, next to Micup's stream pill ("1080p 60 FPS · LIVE") on a live you watch.
+   Shows while the mouse is on the live, fades out after. */
+.bmu-fg-pill {
   position: fixed;
   z-index: 2147483000;
   display: none;
-  height: 20px;
-  padding: 0 8px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.62);
-  color: #f2f2f3;
-  font: 650 11px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  letter-spacing: 0.01em;
+  align-items: center;
+  gap: 2px;
+  height: 24px;
+  padding: 2px;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(12, 12, 15, 0.74);
+  -webkit-backdrop-filter: blur(10px) saturate(1.2);
+  backdrop-filter: blur(10px) saturate(1.2);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  font: 600 11px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  user-select: none;
+  opacity: 0;
+  transform: translateY(-3px);
+  pointer-events: none;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.bmu-fg-pill.is-visible {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+
+.bmu-fg-pill button {
+  height: 18px;
+  margin: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  font: inherit;
   cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+  transition: background 120ms ease, color 120ms ease;
 }
 
-.bmu-fg-btn:hover {
-  background: rgba(20, 20, 24, 0.86);
-  border-color: rgba(255, 255, 255, 0.3);
+.bmu-fg-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px 0 6px;
+  color: #dcdce2;
+  font-weight: 700 !important;
+  letter-spacing: 0.02em;
 }
 
-.bmu-fg-btn.is-on {
-  border-color: rgba(35, 165, 90, 0.75);
-  color: #8ff0b4;
+.bmu-fg-toggle:hover,
+.bmu-fg-seg button:hover {
+  background: rgba(255, 255, 255, 0.09);
+  color: #ffffff;
+}
+
+.bmu-fg-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #6c6c76;
+  transition: background 160ms ease, box-shadow 160ms ease;
+}
+
+.bmu-fg-pill.is-on .bmu-fg-dot {
+  background: #3ddc84;
+  box-shadow: 0 0 6px rgba(61, 220, 132, 0.75);
+}
+
+.bmu-fg-pill.is-starting .bmu-fg-dot {
+  background: #f0b232;
+  animation: bmu-fg-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes bmu-fg-pulse {
+  50% { opacity: 0.35; }
+}
+
+.bmu-fg-seg {
+  display: flex;
+  gap: 1px;
+  padding-left: 3px;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.bmu-fg-seg button {
+  min-width: 26px;
+  padding: 0 5px;
+  color: #9a9aa5;
+  font-size: 10.5px;
+}
+
+.bmu-fg-seg button.is-selected {
+  background: rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+}
+
+.bmu-fg-pill.is-on .bmu-fg-seg button.is-selected {
+  background: rgba(61, 220, 132, 0.2);
+  color: #b9f5d0;
+}
+
+.bmu-fg-stats {
+  padding: 0 6px 0 5px;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  color: #b9f5d0;
+  font-size: 10.5px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bmu-fg-pill,
+  .bmu-fg-pill button,
+  .bmu-fg-dot {
+    transition: none;
+  }
+  .bmu-fg-pill.is-starting .bmu-fg-dot {
+    animation: none;
+  }
 }
 
 /* Frame Gen built-in engine: canvas drawn exactly over the picture of the live */
