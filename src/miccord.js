@@ -667,74 +667,151 @@
 
   const FG_LEVELS = 4; // pyramid levels below the 1/4 luma
   const FG_RADII = [2, 2, 2, 5]; // search radius per level (index 0 = finest)
+  const FG_GPU_IDLE_MS = 60000; // how long the device and pipelines outlive the last FG session
+
+  // The GPU device and compiled pipelines, shared by every FG session: turning FG on again (or on
+  // another live) skips adapter/device setup and shader compilation. Released after a minute off.
+  let fgGpuPromise = null;
+  let fgGpuCurrent = null;
+  let fgGpuUsers = 0;
+  let fgGpuIdleTimer = null;
+
+  async function createFgGpu() {
+    if (!navigator.gpu) throw new Error("WebGPU indisponível");
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!adapter) throw new Error("Nenhuma placa de vídeo para o WebGPU");
+    const device = await adapter.requestDevice();
+    const gpu = {
+      device,
+      adapterInfo: adapter.info || {},
+      format: navigator.gpu.getPreferredCanvasFormat(),
+      lost: false,
+      lostReason: null,
+    };
+    device.lost.then((info) => {
+      gpu.lost = true;
+      gpu.lostReason = info?.message || "device lost";
+      if (fgGpuCurrent === gpu) {
+        fgGpuCurrent = null;
+        fgGpuPromise = null;
+      }
+    });
+    gpu.linear = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" });
+    const mod = (code) => device.createShaderModule({ code });
+    const copyMod = mod(FG_WGSL);
+    gpu.copyPipe = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: copyMod, entryPoint: "vsFull" },
+      fragment: { module: copyMod, entryPoint: "fsCopy", targets: [{ format: "rgba8unorm" }] },
+    });
+    const comp = (code) => device.createComputePipeline({ layout: "auto", compute: { module: mod(code), entryPoint: "main" } });
+    gpu.lumaPipe = comp(FG_WGSL_LUMA);
+    gpu.downPipe = comp(FG_WGSL_DOWN);
+    gpu.flowPipe = comp(FG_WGSL_FLOW);
+    gpu.medianPipe = comp(FG_WGSL_MEDIAN);
+    gpu.smoothPipe = comp(FG_WGSL_SMOOTH);
+    const interpMod = mod(FG_WGSL_INTERP);
+    gpu.interpPipe = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: interpMod, entryPoint: "vsFull" },
+      fragment: { module: interpMod, entryPoint: "fsInterp", targets: [{ format: gpu.format }] },
+    });
+    gpu.flowParams = [];
+    for (let l = 0; l < FG_LEVELS; l++) {
+      const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const data = new ArrayBuffer(16);
+      new Int32Array(data, 0, 1)[0] = FG_RADII[l];
+      new Uint32Array(data, 4, 1)[0] = l === FG_LEVELS - 1 ? 0 : 1;
+      new Float32Array(data, 8, 1)[0] = 0.02;
+      device.queue.writeBuffer(b, 0, data);
+      gpu.flowParams.push(b);
+    }
+    return gpu;
+  }
+
+  async function acquireFgGpu() {
+    clearTimeout(fgGpuIdleTimer);
+    fgGpuIdleTimer = null;
+    if (!fgGpuPromise) {
+      const pending = createFgGpu().then((gpu) => (fgGpuCurrent = gpu));
+      fgGpuPromise = pending;
+      pending.catch(() => {
+        if (fgGpuPromise === pending) fgGpuPromise = null;
+      });
+    }
+    const gpu = await fgGpuPromise;
+    fgGpuUsers++;
+    return gpu;
+  }
+
+  function releaseFgGpu() {
+    fgGpuUsers = Math.max(0, fgGpuUsers - 1);
+    if (fgGpuUsers > 0 || fgGpuIdleTimer) return;
+    fgGpuIdleTimer = setTimeout(() => {
+      fgGpuIdleTimer = null;
+      const gpu = fgGpuCurrent;
+      if (fgGpuUsers > 0 || !gpu) return;
+      fgGpuCurrent = null;
+      fgGpuPromise = null;
+      try {
+        gpu.device.destroy();
+      } catch {}
+    }, FG_GPU_IDLE_MS);
+  }
 
   class FgEngine {
     static async create(canvas) {
-      if (!navigator.gpu) throw new Error("WebGPU indisponível");
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-      if (!adapter) throw new Error("Nenhuma placa de vídeo para o WebGPU");
-      const device = await adapter.requestDevice();
-      return new FgEngine(device, adapter, canvas);
+      const gpu = await acquireFgGpu();
+      try {
+        return new FgEngine(gpu, canvas);
+      } catch (e) {
+        releaseFgGpu();
+        throw e;
+      }
     }
 
-    constructor(device, adapter, canvas) {
-      this.device = device;
-      this.adapterInfo = adapter.info || {};
+    constructor(gpu, canvas) {
+      this.gpu = gpu;
+      this.device = gpu.device;
+      this.adapterInfo = gpu.adapterInfo;
       this.canvas = canvas;
       this.ctx = canvas.getContext("webgpu");
-      this.format = navigator.gpu.getPreferredCanvasFormat();
-      this.ctx.configure({ device, format: this.format, alphaMode: "opaque" });
-      this.lost = false;
-      device.lost.then((info) => {
-        this.lost = true;
-        this.lostReason = info?.message || "device lost";
-      });
-      this.linear = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" });
-      const mod = (code) => device.createShaderModule({ code });
-      const copyMod = mod(FG_WGSL);
-      this.copyPipe = device.createRenderPipeline({
-        layout: "auto",
-        vertex: { module: copyMod, entryPoint: "vsFull" },
-        fragment: { module: copyMod, entryPoint: "fsCopy", targets: [{ format: "rgba8unorm" }] },
-      });
-      const comp = (code) => device.createComputePipeline({ layout: "auto", compute: { module: mod(code), entryPoint: "main" } });
-      this.lumaPipe = comp(FG_WGSL_LUMA);
-      this.downPipe = comp(FG_WGSL_DOWN);
-      this.flowPipe = comp(FG_WGSL_FLOW);
-      this.medianPipe = comp(FG_WGSL_MEDIAN);
-      this.smoothPipe = comp(FG_WGSL_SMOOTH);
-      const interpMod = mod(FG_WGSL_INTERP);
-      this.interpPipe = device.createRenderPipeline({
-        layout: "auto",
-        vertex: { module: interpMod, entryPoint: "vsFull" },
-        fragment: { module: interpMod, entryPoint: "fsInterp", targets: [{ format: this.format }] },
-      });
-      this.interpUniform = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.format = gpu.format;
+      this.ctx.configure({ device: this.device, format: this.format, alphaMode: "opaque" });
+      this.interpUniform = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.uniformData = new Float32Array(12);
       this.crop = [0, 0, 1, 1]; // visible part of the frame (uv offset, uv size)
       this.maxHeight = 1080;    // frames taller than this are processed scaled down
-      this.flowParams = [];
-      for (let l = 0; l < FG_LEVELS; l++) {
-        const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        const data = new ArrayBuffer(16);
-        new Int32Array(data, 0, 1)[0] = FG_RADII[l];
-        new Uint32Array(data, 4, 1)[0] = l === FG_LEVELS - 1 ? 0 : 1;
-        new Float32Array(data, 8, 1)[0] = 0.02;
-        device.queue.writeBuffer(b, 0, data);
-        this.flowParams.push(b);
-      }
+      this.textures = [];
       this.w = 0;
       this.h = 0;
       this.frames = 0; // real frames received
       this.debugFlow = false;
+      this.released = false;
     }
 
-    // Textures for a source of w x h.
+    get lost() {
+      return this.gpu.lost;
+    }
+
+    get lostReason() {
+      return this.gpu.lostReason;
+    }
+
+    // Textures for a source of w x h, plus every view and bind group that uses only them (built
+    // once per size instead of on every frame).
     ensure(w, h) {
       if (w === this.w && h === this.h) return;
+      this.freeTextures();
       const d = this.device;
+      const g = this.gpu;
       this.w = w;
       this.h = h;
-      const tex = (tw, th, format, usage) => d.createTexture({ size: [Math.max(1, tw), Math.max(1, th)], format, usage });
+      const tex = (tw, th, format, usage) => {
+        const t = d.createTexture({ size: [Math.max(1, tw), Math.max(1, th)], format, usage });
+        this.textures.push(t);
+        return t;
+      };
       const colorUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
       const storUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC;
       this.color = [tex(w, h, "rgba8unorm", colorUsage), tex(w, h, "rgba8unorm", colorUsage)];
@@ -755,8 +832,55 @@
       this.flowSm = this.levelSize.map(([a, b]) => tex(a, b, "rgba16float", storUsage));
       this.flowSmB = this.levelSize.map(([a, b]) => tex(a, b, "rgba16float", storUsage));
       this.noFlow = tex(1, 1, "rgba16float", GPUTextureUsage.TEXTURE_BINDING); // "no coarser level"
+
+      const V = (t) => t.createView();
+      this.colorView = this.color.map(V);
+      const lumaView = this.luma.map((levels) => levels.map(V));
+      const noFlowView = V(this.noFlow);
+      // forward flow (previous -> current frame) and backward flow (current -> previous)
+      const dirs = [
+        { tmp: this.flowTmp.map(V), sm: this.flowSm.map(V), out: V(this.flowF) },
+        { tmp: this.flowTmpB.map(V), sm: this.flowSmB.map(V), out: V(this.flowB) },
+      ];
+      this.flowFView = dirs[0].out;
+      this.flowBView = dirs[1].out;
+      // per index of the current frame's textures (they swap every frame)
+      this.frameGroups = [0, 1].map((cur) => {
+        const L = lumaView[cur];
+        const P = lumaView[cur ^ 1];
+        return {
+          luma: this.bg(g.lumaPipe, [this.colorView[cur], g.linear, L[0]]),
+          down: L.map((view, l) => (l === 0 ? null : this.bg(g.downPipe, [L[l - 1], view]))),
+          flow: [
+            [P, L],
+            [L, P],
+          ].map(([A, B], k) =>
+            this.levelSize.map((_, l) => {
+              const coarse = l === FG_LEVELS - 1 ? noFlowView : dirs[k].sm[l + 1];
+              return {
+                flow: this.bg(g.flowPipe, [A[l], B[l], coarse, dirs[k].tmp[l], { buffer: g.flowParams[l] }]),
+                smooth: this.bg(g.smoothPipe, [dirs[k].tmp[l], A[l], dirs[k].sm[l]]),
+              };
+            })
+          ),
+        };
+      });
+      this.medianGroups = dirs.map((dir) => this.bg(g.medianPipe, [dir.sm[0], dir.out]));
+      this.interpGroups = new Map(); // (previous, current) texture indexes -> bind group
       this.cur = 0; // index of the current frame's textures
       this.frames = 0;
+    }
+
+    freeTextures() {
+      for (const t of this.textures) {
+        try {
+          t.destroy();
+        } catch {}
+      }
+      this.textures = [];
+      this.interpGroups = new Map();
+      this.w = 0;
+      this.h = 0;
     }
 
     bg(pipe, entries) {
@@ -765,7 +889,7 @@
 
     // A new real frame: a <video> (from requestVideoFrameCallback) or a VideoFrame.
     pushFrame(video) {
-      if (this.lost) return false;
+      if (this.lost || this.released) return false;
       let w = video.videoWidth || video.displayWidth;
       let h = video.videoHeight || video.displayHeight;
       if (!w || !h) return false;
@@ -776,14 +900,15 @@
       this.ensure(w, h);
       this.cur ^= 1;
       const cur = this.cur;
-      const prev = cur ^ 1;
+      const g = this.gpu;
       const d = this.device;
+      const groups = this.frameGroups[cur];
       const enc = d.createCommandEncoder();
-      // 1. copy the frame
+      // 1. copy the frame (an external texture is only valid for this frame: its bind group too)
       const ext = d.importExternalTexture({ source: video });
-      const pass = enc.beginRenderPass({ colorAttachments: [{ view: this.color[cur].createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
-      pass.setPipeline(this.copyPipe);
-      pass.setBindGroup(0, this.bg(this.copyPipe, [ext, this.linear]));
+      const pass = enc.beginRenderPass({ colorAttachments: [{ view: this.colorView[cur], loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
+      pass.setPipeline(g.copyPipe);
+      pass.setBindGroup(0, this.bg(g.copyPipe, [ext, g.linear]));
       pass.draw(3);
       pass.end();
       // 2. luma pyramid
@@ -793,24 +918,18 @@
         cp.setBindGroup(0, group);
         cp.dispatchWorkgroups(Math.ceil(x / 8), Math.ceil(y / 8));
       };
-      const L = this.luma[cur];
-      dispatch(this.lumaPipe, this.bg(this.lumaPipe, [this.color[cur].createView(), this.linear, L[0].createView()]), this.levelSize[0]);
-      for (let l = 1; l < FG_LEVELS; l++) {
-        dispatch(this.downPipe, this.bg(this.downPipe, [L[l - 1].createView(), L[l].createView()]), this.levelSize[l]);
-      }
+      dispatch(g.lumaPipe, groups.luma, this.levelSize[0]);
+      for (let l = 1; l < FG_LEVELS; l++) dispatch(g.downPipe, groups.down[l], this.levelSize[l]);
       // 3. flow both ways, coarse to fine
       if (this.frames >= 1) {
-        const P = this.luma[prev];
-        const run = (A, B, tmp, sm, out) => {
+        for (let k = 0; k < 2; k++) {
+          const levels = groups.flow[k];
           for (let l = FG_LEVELS - 1; l >= 0; l--) {
-            const coarse = l === FG_LEVELS - 1 ? this.noFlow : sm[l + 1];
-            dispatch(this.flowPipe, this.bg(this.flowPipe, [A[l].createView(), B[l].createView(), coarse.createView(), tmp[l].createView(), { buffer: this.flowParams[l] }]), this.levelSize[l]);
-            dispatch(this.smoothPipe, this.bg(this.smoothPipe, [tmp[l].createView(), A[l].createView(), sm[l].createView()]), this.levelSize[l]);
+            dispatch(g.flowPipe, levels[l].flow, this.levelSize[l]);
+            dispatch(g.smoothPipe, levels[l].smooth, this.levelSize[l]);
           }
-          dispatch(this.medianPipe, this.bg(this.medianPipe, [sm[0].createView(), out.createView()]), this.levelSize[0]);
-        };
-        run(P, L, this.flowTmp, this.flowSm, this.flowF);
-        run(L, P, this.flowTmpB, this.flowSmB, this.flowB);
+          dispatch(g.medianPipe, this.medianGroups[k], this.levelSize[0]);
+        }
       }
       cp.end();
       d.queue.submit([enc.finish()]);
@@ -820,31 +939,51 @@
 
     // Draw the frame between the previous and the current real frame (t in 0..1).
     draw(t, targetView) {
-      if (this.lost || this.frames < 1) return false;
+      if (this.lost || this.released || this.frames < 1) return false;
       const d = this.device;
+      const g = this.gpu;
       const cur = this.cur;
       const prev = this.frames >= 2 ? cur ^ 1 : cur;
-      const tt = this.frames >= 2 ? Math.min(1, Math.max(0, t)) : 1;
-      const u = new Float32Array([tt, 4, 1.5, this.debugFlow ? 1 : 0, this.w, this.h, 0, 0, ...this.crop]);
+      const u = this.uniformData;
+      u[0] = this.frames >= 2 ? Math.min(1, Math.max(0, t)) : 1;
+      u[1] = 4;
+      u[2] = 1.5;
+      u[3] = this.debugFlow ? 1 : 0;
+      u[4] = this.w;
+      u[5] = this.h;
+      u[6] = 0;
+      u[7] = 0;
+      u.set(this.crop, 8);
       d.queue.writeBuffer(this.interpUniform, 0, u);
+      const key = prev * 2 + cur;
+      let group = this.interpGroups.get(key);
+      if (!group) {
+        group = this.bg(g.interpPipe, [this.colorView[prev], this.colorView[cur], this.flowFView, this.flowBView, g.linear, { buffer: this.interpUniform }]);
+        this.interpGroups.set(key, group);
+      }
       const enc = d.createCommandEncoder();
       const view = targetView || this.ctx.getCurrentTexture().createView();
       const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
-      pass.setPipeline(this.interpPipe);
-      pass.setBindGroup(0, this.bg(this.interpPipe, [this.color[prev].createView(), this.color[cur].createView(), this.flowF.createView(), this.flowB.createView(), this.linear, { buffer: this.interpUniform }]));
+      pass.setPipeline(g.interpPipe);
+      pass.setBindGroup(0, group);
       pass.draw(3);
       pass.end();
       d.queue.submit([enc.finish()]);
       return true;
     }
 
+    // Frees this session's textures; the device and pipelines stay for the next one.
     destroy() {
+      if (this.released) return;
+      this.released = true;
       try {
         this.ctx.unconfigure();
       } catch {}
+      this.freeTextures();
       try {
-        this.device.destroy();
+        this.interpUniform.destroy();
       } catch {}
+      releaseFgGpu();
     }
   }
   // </fg-engine>
@@ -1046,7 +1185,8 @@
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     if (!r.width || !r.height || !vw || !vh) return false;
-    const fit = getComputedStyle(video).objectFit;
+    // object-fit only changes with the player: read it again only after a resize or a new player
+    const fit = st.fit || (st.fit = getComputedStyle(video).objectFit);
     let pic = { left: r.left, top: r.top, width: r.width, height: r.height };
     let crop = [0, 0, 1, 1];
     if (fit === "cover") {
@@ -1065,13 +1205,22 @@
     const cr = canvas.getBoundingClientRect();
     const ox = cr.left - (parseFloat(canvas.style.left) || 0);
     const oy = cr.top - (parseFloat(canvas.style.top) || 0);
-    canvas.style.left = `${pic.left - ox}px`;
-    canvas.style.top = `${pic.top - oy}px`;
-    canvas.style.width = `${pic.width}px`;
-    canvas.style.height = `${pic.height}px`;
+    // written only when they change: every write makes the browser recompute the canvas's style
+    const setPx = (prop, value) => {
+      const px = `${value}px`;
+      if (canvas.style[prop] !== px) canvas.style[prop] = px;
+    };
+    setPx("left", pic.left - ox);
+    setPx("top", pic.top - oy);
+    setPx("width", pic.width);
+    setPx("height", pic.height);
+    // Never draw more pixels than the live has: a 1080p live in fullscreen on a 1440p or 4K screen
+    // is drawn at 1080p and the browser scales the canvas up, as it does with the <video> itself.
     const dpr = window.devicePixelRatio || 1;
-    const cw = Math.max(1, Math.round(pic.width * dpr));
-    const ch = Math.max(1, Math.round(pic.height * dpr));
+    const sourceRows = Math.min(vh, engine.maxHeight) * crop[3];
+    const scale = Math.min(1, sourceRows / (pic.height * dpr));
+    const cw = Math.max(1, Math.round(pic.width * dpr * scale));
+    const ch = Math.max(1, Math.round(pic.height * dpr * scale));
     if (canvas.width !== cw || canvas.height !== ch) {
       canvas.width = cw;
       canvas.height = ch;
@@ -1093,8 +1242,17 @@
       canvas.remove();
       throw e;
     }
-    const st = { engine, canvas, video, segStart: 0, interval: 1000 / 60, lastArrival: 0, real: 0, drawn: 0, statAt: performance.now(), realFps: 0, shownFps: 0, raf: 0, vfc: 0, n: 0, lastKey: "", redraw: true, stopped: false };
+    const st = { engine, canvas, video, segStart: 0, interval: 1000 / 60, lastArrival: 0, real: 0, drawn: 0, statAt: performance.now(), realFps: 0, shownFps: 0, raf: 0, vfc: 0, lastKey: "", redraw: true, stopped: false, fit: null, placeDue: false, placedAt: 0, ro: null };
     frameGen.builtin = st;
+    // The canvas follows the picture: at once when the player is resized, and every 200 ms for
+    // moves that don't resize it (each check reads the layout).
+    if (typeof ResizeObserver === "function") {
+      st.ro = new ResizeObserver(() => {
+        st.fit = null;
+        st.placeDue = true;
+      });
+      st.ro.observe(video);
+    }
     placeFgCanvas(st);
     // each real frame: copy + flow; then show it one frame late, filling the gap with in-betweens
     const onFrame = (now) => {
@@ -1118,6 +1276,9 @@
         st.video.cancelVideoFrameCallback(st.vfc);
       } catch {}
       st.video = next;
+      st.fit = null;
+      st.ro?.disconnect();
+      st.ro?.observe(next);
       next.insertAdjacentElement("afterend", st.canvas);
       st.vfc = next.requestVideoFrameCallback(onFrame);
       st.redraw = placeFgCanvas(st) || true;
@@ -1130,7 +1291,11 @@
         showToast("A placa de vídeo interrompeu o Frame Gen. Clique em FG para tentar de novo.", "error");
         return;
       }
-      if (st.n++ % 10 === 0 && placeFgCanvas(st)) st.redraw = true;
+      if (st.placeDue || now - st.placedAt >= 200) {
+        st.placeDue = false;
+        st.placedAt = now;
+        if (placeFgCanvas(st)) st.redraw = true;
+      }
       // Máx: a new in-between at every display refresh. 2x/3x/4x: that many frames per real
       // frame (t in steps of 1/n), drawing only when the step changes.
       const m = frameGenMultiplier();
@@ -1169,6 +1334,7 @@
     if (!st) return;
     st.stopped = true;
     cancelAnimationFrame(st.raf);
+    st.ro?.disconnect();
     try {
       st.video.cancelVideoFrameCallback(st.vfc);
     } catch {}
@@ -1238,10 +1404,20 @@
     }, 400);
   }
 
+  // Live collection: its length costs nothing, so mouse moves while no video is on the page (text
+  // chat, settings) skip the scan. The list of lives is reused for 300 ms of mouse moves.
+  const allVideos = document.getElementsByTagName("video");
+  const hoverCandidates = { at: 0, list: [] };
   function frameGenPointer(ev) {
-    if (!frameGenEnabled() || !frameGenAvailable()) return;
+    if (allVideos.length === 0 || !frameGenEnabled() || !frameGenAvailable()) return;
     if (frameGen.pill && frameGen.pill.contains(ev.target)) return; // handled by pointerenter
-    const hit = watchableVideos().find((v) => {
+    const now = performance.now();
+    if (now - hoverCandidates.at > 300) {
+      hoverCandidates.at = now;
+      hoverCandidates.list = watchableVideos();
+    }
+    const hit = hoverCandidates.list.find((v) => {
+      if (!v.isConnected) return false;
       const r = v.getBoundingClientRect();
       return ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom;
     }) || null;
@@ -1771,15 +1947,53 @@
     scheduleStreamHealth(0);
   }
 
+  // Settings typed key by key (QuickCSS): saved once typing pauses, or when Micup closes.
+  let settingsSaveTimer = null;
+  function saveSettingsSoon(delay = 400) {
+    clearTimeout(settingsSaveTimer);
+    settingsSaveTimer = setTimeout(flushSettingsSoon, delay);
+  }
+  function flushSettingsSoon() {
+    if (!settingsSaveTimer) return;
+    clearTimeout(settingsSaveTimer);
+    settingsSaveTimer = null;
+    saveSettings();
+  }
+
+  // The log is written as one JSON string: a burst of deletions (a purge) writes it once, at
+  // most every second, instead of once per message.
+  let logsSaveTimer = null;
   function saveMessageLogs() {
-    try {
-      const max = state.settings.plugins.MessageLogger?.maxLogs || 250;
-      if (state.messageLogs.length > max) {
-        state.messageLogs = state.messageLogs.slice(0, max);
-      }
-      localStorage.setItem(MSGLOG_KEY, JSON.stringify(state.messageLogs));
-    } catch {}
+    const max = state.settings.plugins.MessageLogger?.maxLogs || 250;
+    if (state.messageLogs.length > max) {
+      state.messageLogs = state.messageLogs.slice(0, max);
+    }
+    if (!logsSaveTimer) logsSaveTimer = setTimeout(flushMessageLogs, 1000);
     notifyUI();
+  }
+  function flushMessageLogs() {
+    if (!logsSaveTimer) return;
+    clearTimeout(logsSaveTimer);
+    logsSaveTimer = null;
+    try {
+      localStorage.setItem(MSGLOG_KEY, JSON.stringify(state.messageLogs));
+    } catch (e) {
+      // localStorage is shared with Micup: when it's full, keep the newest half rather than nothing
+      try {
+        state.messageLogs = state.messageLogs.slice(0, Math.floor(state.messageLogs.length / 2));
+        localStorage.setItem(MSGLOG_KEY, JSON.stringify(state.messageLogs));
+        Logger.warn("Message Logger: armazenamento cheio, os registros mais antigos foram descartados.", e);
+      } catch {}
+    }
+  }
+
+  for (const type of ["pagehide", "beforeunload"]) {
+    window.addEventListener(type, () => {
+      try {
+        flushSettingsSoon();
+        flushMessageLogs();
+      } catch {}
+    });
   }
 
   function notifyUI() {
@@ -1788,7 +2002,6 @@
         fn();
       } catch {}
     }
-    updateFloatingWidget();
   }
 
   // ==========================================================================
@@ -1922,15 +2135,19 @@
 
   let quickCssStyleEl = null;
 
+  // Both only touch the page when the value changed: rewriting the attribute or the <style> makes
+  // the browser recompute the style of the whole app, and saveSettings runs on every toggle.
   function applyThemesAndQuickCSS() {
     if (!document.documentElement) return;
     const theme = state.settings.activeTheme || "obsidian";
-    if (theme === "obsidian" || theme === "default") {
-      document.documentElement.setAttribute("data-miccord-theme", "obsidian");
-    } else {
-      document.documentElement.setAttribute("data-miccord-theme", theme);
+    const attr = theme === "default" ? "obsidian" : theme;
+    if (document.documentElement.getAttribute("data-miccord-theme") !== attr) {
+      document.documentElement.setAttribute("data-miccord-theme", attr);
     }
+    applyQuickCss();
+  }
 
+  function applyQuickCss() {
     if (!quickCssStyleEl) {
       quickCssStyleEl = document.getElementById("miccord-quickcss-style");
       if (!quickCssStyleEl && document.head) {
@@ -1946,9 +2163,8 @@
     }
 
     if (quickCssStyleEl) {
-      quickCssStyleEl.textContent = state.settings.quickCssEnabled
-        ? state.settings.quickCss || ""
-        : "";
+      const css = state.settings.quickCssEnabled ? state.settings.quickCss || "" : "";
+      if (quickCssStyleEl.textContent !== css) quickCssStyleEl.textContent = css;
     }
   }
 
@@ -2423,7 +2639,10 @@
       font-size: 12.5px; font-weight: 500; box-shadow: 0 12px 36px rgba(0,0,0,0.85);
       display: flex; align-items: center; gap: 8px;
     `;
-    el.innerHTML = `${svgIconHtml(type === "error" ? "x" : type === "success" ? "check" : "zap", 14)} <span>${message}</span>`;
+    el.innerHTML = svgIconHtml(type === "error" ? "x" : type === "success" ? "check" : "zap", 14);
+    const text = document.createElement("span");
+    text.textContent = String(message); // messages can carry error text: never parse it as HTML
+    el.appendChild(text);
     document.body.appendChild(el);
     setTimeout(() => el.remove(), 3000);
   }
@@ -2625,6 +2844,18 @@
     },
   ];
 
+  // Stores found by shape scan every loaded module; the sync runs on every plugin toggle and a
+  // dozen times while Micup loads, so a store is looked up only until it's found.
+  const syncStoreCache = new Map();
+  function findSyncStore(name, test) {
+    let store = syncStoreCache.get(name);
+    if (!store) {
+      store = Webpack.findExport(test);
+      if (store) syncStoreCache.set(name, store);
+    }
+    return store;
+  }
+
   // Sync runtime plugin settings with Micup's internal stores
   function syncStoreBasedPlugins() {
     // Each step is independent: a store that isn't there (or throws) must not stop the rest.
@@ -2693,7 +2924,8 @@
       // 3. ExperimentsAndHiddenTabs: Micup's DeveloperMode store unlocks the "Developer"
       //    settings category after 7 taps on the build number. Do the same taps.
       if (state.settings.plugins.ExperimentsAndHiddenTabs?.enabled) {
-        const devMode = Webpack.findExport(
+        const devMode = findSyncStore(
+          "developer-mode",
           (o) => typeof o === "object" && typeof o.registerBuildTap === "function" && "manuallyEnabled" in o
         );
         // isDeveloper also checks the current user (staff); fall back to the manual flag.
@@ -2714,7 +2946,8 @@
       // 4. AlwaysTrustDomains › clean tracking params: Micup's own "sanitize URLs" preference.
       //    Only write when it differs: every write is synced to Micup's servers.
       if (state.settings.plugins.AlwaysTrustDomains?.enabled) {
-        const userSettings = Webpack.findExport(
+        const userSettings = findSyncStore(
+          "user-settings",
           (o) => typeof o === "object" && typeof o.setSanitizeUrls === "function" && typeof o.getSanitizeUrls === "function"
         );
         const wanted = Boolean(state.settings.plugins.AlwaysTrustDomains.cleanTrackingParams);
@@ -2953,11 +3186,45 @@
         return {
           id: authorObj?.id || msg?.author_id || authorIdFallback || "unknown",
           username: authorObj?.username || msg?.author?.username || "Usuário",
-          GlobalName: authorObj?.globalName || authorObj?.global_name || authorObj?.username || "Usuário",
+          globalName: authorObj?.globalName || authorObj?.global_name || authorObj?.username || "Usuário",
           avatar: authorObj?.avatar || null,
           bot: Boolean(authorObj?.bot),
           isSelf: Boolean(currentUser && (authorObj?.id === currentUser.id || msg?.author_id === currentUser.id)),
         };
+      }
+
+      // One message being deleted (single or bulk): log it unless the author is ignored, and
+      // mark it [APAGADA] when it should stay in the chat. `keep`: Micup must not remove it.
+      function logDeletedMessage(msg, event, msgId, cfg, kind) {
+        if (!msg) return { logged: false, keep: false };
+        if (msg.__miccordDeleted) return { logged: false, keep: !!cfg.keepDeletedInChat }; // already kept
+        const authorInfo = extractAuthorInfo(msg);
+        if ((cfg.ignoreBots && authorInfo.bot) || (cfg.ignoreSelf && authorInfo.isSelf)) {
+          return { logged: false, keep: false };
+        }
+        state.messageLogs.unshift({
+          id: `${msgId}_${kind}_${Date.now()}`,
+          messageId: msgId,
+          type: "deleted",
+          channelId: event.channel_id,
+          guildId: event.guild_id || null,
+          author: authorInfo,
+          content: msg.content || "",
+          attachments: Array.isArray(msg.attachments)
+            ? msg.attachments.map((a) => ({ url: a.url, filename: a.filename }))
+            : [],
+          timestamp: Date.now(),
+        });
+        if (!cfg.keepDeletedInChat) return { logged: true, keep: false };
+        try {
+          msg.__miccordDeleted = true;
+          if (typeof msg.content === "string" && !msg.content.includes("[APAGADA]")) {
+            msg.content = `${msg.content}  \`[APAGADA]\``;
+          }
+          return { logged: true, keep: true };
+        } catch {
+          return { logged: true, keep: false };
+        }
       }
 
       // Intercept single message deletion
@@ -2971,40 +3238,11 @@
             return orig(...args);
           }
 
-          const existingMsg = store.getMessage?.(event.channel_id, event.id);
-          if (existingMsg && !existingMsg.__miccordDeleted) {
-            const authorInfo = extractAuthorInfo(existingMsg);
-            const shouldSkip =
-              (cfg.ignoreBots && authorInfo.bot) || (cfg.ignoreSelf && authorInfo.isSelf);
-
-            if (!shouldSkip) {
-              state.messageLogs.unshift({
-                id: `${event.id}_del_${Date.now()}`,
-                messageId: event.id,
-                type: "deleted",
-                channelId: event.channel_id,
-                guildId: event.guild_id || null,
-                author: authorInfo,
-                content: existingMsg.content || "",
-                attachments: Array.isArray(existingMsg.attachments)
-                  ? existingMsg.attachments.map((a) => ({ url: a.url, filename: a.filename }))
-                  : [],
-                timestamp: Date.now(),
-              });
-              saveMessageLogs();
-            }
-
-            // Keep deleted message visible right in the chat!
-            if (cfg.keepDeletedInChat && !shouldSkip) {
-              try {
-                existingMsg.__miccordDeleted = true;
-                if (typeof existingMsg.content === "string" && !existingMsg.content.includes("[APAGADA]")) {
-                  existingMsg.content = `${existingMsg.content}  \`[APAGADA]\``;
-                }
-                if (typeof store.emitChange === "function") store.emitChange();
-                return false; // Prevent removal from channel messages map!
-              } catch {}
-            }
+          const { logged, keep } = logDeletedMessage(store.getMessage?.(event.channel_id, event.id), event, event.id, cfg, "del");
+          if (logged) saveMessageLogs();
+          if (keep) {
+            if (typeof store.emitChange === "function") store.emitChange();
+            return false; // keep it in the channel's messages
           }
           return orig(...args);
         },
@@ -3022,35 +3260,20 @@
             return orig(...args);
           }
 
+          let logged = false;
+          const removeIds = [];
           for (const msgId of event.ids) {
-            const existingMsg = store.getMessage?.(event.channel_id, msgId);
-            if (existingMsg && !existingMsg.__miccordDeleted) {
-              const authorInfo = extractAuthorInfo(existingMsg);
-              state.messageLogs.unshift({
-                id: `${msgId}_bulk_${Date.now()}`,
-                messageId: msgId,
-                type: "deleted",
-                channelId: event.channel_id,
-                guildId: event.guild_id || null,
-                author: authorInfo,
-                content: existingMsg.content || "",
-                attachments: [],
-                timestamp: Date.now(),
-              });
-              if (cfg.keepDeletedInChat) {
-                existingMsg.__miccordDeleted = true;
-                if (typeof existingMsg.content === "string" && !existingMsg.content.includes("[APAGADA]")) {
-                  existingMsg.content = `${existingMsg.content}  \`[APAGADA]\``;
-                }
-              }
-            }
+            const result = logDeletedMessage(store.getMessage?.(event.channel_id, msgId), event, msgId, cfg, "bulk");
+            if (result.logged) logged = true;
+            if (!result.keep) removeIds.push(msgId);
           }
-          saveMessageLogs();
-          if (cfg.keepDeletedInChat) {
-            if (typeof store.emitChange === "function") store.emitChange();
-            return false;
-          }
-          return orig(...args);
+          if (logged) saveMessageLogs();
+          if (removeIds.length === event.ids.length) return orig(...args);
+          // Some stay in the chat: Micup removes only the others (ignored authors, not cached).
+          let result = false;
+          if (removeIds.length > 0) result = orig({ ...event, ids: removeIds }, ...args.slice(1));
+          if (typeof store.emitChange === "function") store.emitChange();
+          return result;
         },
         "MessageLoggerDeleteBulk"
       );
@@ -3088,7 +3311,9 @@
                 });
                 saveMessageLogs();
 
-                if (cfg.showInlineEdits) {
+                // Not on your own messages: the marker goes into the stored text, so editing the
+                // message again would put "[Antes]" in the edit box (and send it).
+                if (cfg.showInlineEdits && !authorInfo.isSelf) {
                   event.content = `${event.content}\n> *[Antes]: ${cleanOld}*`;
                 }
               }
@@ -5150,6 +5375,10 @@
   function ThemesPage() {
     const React = getReact();
     useMiccordState();
+    // The editor keeps its own text: each key re-renders only this page and applies the CSS;
+    // the settings are saved once typing pauses (and when leaving the page).
+    const [css, setCss] = React.useState(state.settings.quickCss || "");
+    React.useEffect(() => flushSettingsSoon, []);
     const current = state.settings.activeTheme || "obsidian";
     const themes = [ORIGINAL_THEME, ...PRESET_THEMES];
 
@@ -5200,12 +5429,15 @@
         }),
         h("textarea", {
           className: "bmu-textarea is-code",
-          value: state.settings.quickCss || "",
+          value: css,
           spellCheck: false,
           placeholder: "/* exemplo */\n.miccord-call-timer { color: #7c5cff; }",
           onChange: (e) => {
-            state.settings.quickCss = e.target.value;
-            saveSettings();
+            const value = e.target.value;
+            setCss(value);
+            state.settings.quickCss = value;
+            applyQuickCss();
+            saveSettingsSoon();
           },
         }),
         h(
@@ -5216,6 +5448,7 @@
             {
               onConfirm: () => {
                 state.settings.quickCss = "";
+                setCss("");
                 saveSettings();
               },
             },
@@ -5319,7 +5552,12 @@
                   h(
                     "div",
                     { className: "bmu-log-head" },
-                    h("span", { className: "bmu-log-author" }, entry.author?.global_name || entry.author?.username || "Desconhecido"),
+                    h(
+                      "span",
+                      { className: "bmu-log-author" },
+                      // `GlobalName`: how 1.0.10 and older saved it (logs already on disk)
+                      entry.author?.globalName || entry.author?.GlobalName || entry.author?.username || "Desconhecido"
+                    ),
                     h("span", { className: "bmu-log-tag" }, entry.type === "deleted" ? "apagada" : "editada"),
                     h("span", { className: "bmu-log-where" }, where(entry)),
                     h(

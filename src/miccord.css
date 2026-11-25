@@ -6,7 +6,13 @@
  * Built-in Preset Themes (applied via html[data-miccord-theme="..."])
  * ============================================================================ */
 
-/* 1. Black Obsidian Mac (Default) */
+/* Variable names are Micup's own (--text-primary, --brand-primary, --background-textarea...),
+ * the ones its stylesheet reads. Discord's names (--text-normal, --brand-experiment,
+ * --channeltextarea-background...) mostly do nothing in Micup. Accent text colours
+ * (--brand-primary-fill, --text-on-brand-primary, --accent-signal-text) are dark on the light
+ * accents so button labels stay readable. */
+
+/* 1. Black Obsidian Mac (Default). Keeps Micup's accent colour. */
 html[data-miccord-theme="obsidian"],
 html[data-miccord-theme="default"],
 html:not([data-miccord-theme]) {
@@ -15,21 +21,15 @@ html:not([data-miccord-theme]) {
   --background-secondary-alt: #0a0a0d !important;
   --background-tertiary: #030304 !important;
   --background-floating: #0e0e12 !important;
-  --background-accent: #16161b !important;
-  --channeltextarea-background: #09090b !important;
-  --input-background: #09090b !important;
-  --modal-background: #070709 !important;
-  --modal-footer-background: #000000 !important;
-  --scrollbar-auto-thumb: rgba(255, 255, 255, 0.14) !important;
-  --scrollbar-auto-track: transparent !important;
-  --brand-experiment: #ffffff !important;
-  --brand-experiment-560: #e4e4e7 !important;
+  --background-textarea: #09090b !important;
+  --scrollbar-thumb-bg: rgba(255, 255, 255, 0.14) !important;
+  --scrollbar-track-bg: transparent !important;
 }
 
 html[data-miccord-theme="obsidian"] body,
-html[data-miccord-theme="obsidian"] #app-mount,
+html[data-miccord-theme="obsidian"] #root,
 html[data-miccord-theme="default"] body,
-html[data-miccord-theme="default"] #app-mount {
+html[data-miccord-theme="default"] #root {
   background-color: #000000 !important;
 }
 
@@ -40,10 +40,10 @@ html[data-miccord-theme="amoled"] {
   --background-secondary-alt: #050505 !important;
   --background-tertiary: #000000 !important;
   --background-floating: #080808 !important;
-  --channeltextarea-background: #080808 !important;
+  --background-textarea: #080808 !important;
 }
 html[data-miccord-theme="amoled"] body,
-html[data-miccord-theme="amoled"] #app-mount {
+html[data-miccord-theme="amoled"] #root {
   background-color: #000000 !important;
 }
 
@@ -54,15 +54,19 @@ html[data-miccord-theme="slate"] {
   --background-secondary-alt: #131a2a !important;
   --background-tertiary: #080b11 !important;
   --background-floating: #131a2a !important;
-  --channeltextarea-background: #101624 !important;
+  --background-textarea: #101624 !important;
 }
 
-/* 4. Cyberpunk Dark */
+/* 4. Cyberpunk Dark: neon pink accent, cyan links */
 html[data-miccord-theme="cyberpunk"] {
   --background-primary: #0a0614 !important;
   --background-secondary: #100a20 !important;
   --background-secondary-alt: #160e2c !important;
   --background-tertiary: #06030c !important;
+  --brand-primary: #f43f5e !important;
+  --brand-primary-light: #fb7185 !important;
+  --accent-signal: #f43f5e !important;
+  --text-link: #22d3ee !important;
 }
 
 /* 5. Catppuccin Mocha */
@@ -72,8 +76,19 @@ html[data-miccord-theme="catppuccin"] {
   --background-secondary-alt: #11111b !important;
   --background-tertiary: #11111b !important;
   --background-floating: #181825 !important;
+  --text-primary: #cdd6f4 !important;
+  --text-secondary: #bac2de !important;
+  --text-primary-muted: #a6adc8 !important;
+  --text-tertiary: #9399b2 !important;
   --text-normal: #cdd6f4 !important;
   --text-muted: #a6adc8 !important;
+  --text-link: #89b4fa !important;
+  --brand-primary: #cba6f7 !important;
+  --brand-primary-light: #dcc4fa !important;
+  --accent-signal: #cba6f7 !important;
+  --brand-primary-fill: #1e1e2e !important;
+  --text-on-brand-primary: #1e1e2e !important;
+  --accent-signal-text: #1e1e2e !important;
 }
 
 /* 6. Dracula Pro */
@@ -82,7 +97,15 @@ html[data-miccord-theme="dracula"] {
   --background-secondary: #21222c !important;
   --background-secondary-alt: #191a21 !important;
   --background-tertiary: #191a21 !important;
+  --text-primary: #f8f8f2 !important;
   --text-normal: #f8f8f2 !important;
+  --text-link: #8be9fd !important;
+  --brand-primary: #bd93f9 !important;
+  --brand-primary-light: #d6bcfb !important;
+  --accent-signal: #bd93f9 !important;
+  --brand-primary-fill: #282a36 !important;
+  --text-on-brand-primary: #282a36 !important;
+  --accent-signal-text: #282a36 !important;
 }
 
 /* 7. Emerald Matrix */
@@ -91,6 +114,13 @@ html[data-miccord-theme="emerald"] {
   --background-secondary: #091610 !important;
   --background-secondary-alt: #0c1c15 !important;
   --background-tertiary: #030806 !important;
+  --text-link: #34d399 !important;
+  --brand-primary: #10b981 !important;
+  --brand-primary-light: #34d399 !important;
+  --accent-signal: #10b981 !important;
+  --brand-primary-fill: #03120c !important;
+  --text-on-brand-primary: #03120c !important;
+  --accent-signal-text: #03120c !important;
 }
 
 /* 8. Frost Midnight */
@@ -99,6 +129,13 @@ html[data-miccord-theme="frost"] {
   --background-secondary: #0d1522 !important;
   --background-secondary-alt: #111b2b !important;
   --background-tertiary: #05080e !important;
+  --text-link: #7dd3fc !important;
+  --brand-primary: #38bdf8 !important;
+  --brand-primary-light: #7dd3fc !important;
+  --accent-signal: #38bdf8 !important;
+  --brand-primary-fill: #05080e !important;
+  --text-on-brand-primary: #05080e !important;
+  --accent-signal-text: #05080e !important;
 }
 
 
@@ -876,11 +913,11 @@ html[data-miccord-theme="frost"] {
 /* ============================================================================
  * Midnight Theme (Port fiel do refact0r para o Micup)
  * ============================================================================ */
-@import url('https://fonts.googleapis.com/css2?family=Figtree:ital,wght@0,300..900;1,300..900&display=swap');
-
+/* No web font: an @import here (after other rules) is ignored by the browser, and at the top
+ * it would download Google Fonts for every user and theme. Figtree is used when installed;
+ * otherwise Micup's own font. */
 html[data-miccord-theme="midnight"] {
-  --font-primary: 'Figtree', sans-serif !important;
-  --font-display: 'Figtree', sans-serif !important;
+  --font-primary: 'Figtree', var(--font-sans), sans-serif !important;
 
   /* Midnight Base Palette */
   --midnight-bg-1: #2c3340;
@@ -911,53 +948,49 @@ html[data-miccord-theme="midnight"] {
   --background-secondary-lighter: var(--midnight-bg-2) !important;
   --background-tertiary: var(--midnight-bg-4) !important;
   --background-floating: var(--midnight-bg-3) !important;
-  --background-accent: var(--midnight-accent-2) !important;
+  --background-textarea: var(--midnight-bg-3) !important;
   --background-modifier-accent: var(--midnight-accent-2) !important;
   --background-modifier-hover: rgba(255, 255, 255, 0.05) !important;
   --background-modifier-active: rgba(255, 255, 255, 0.08) !important;
   --background-modifier-selected: rgba(255, 255, 255, 0.08) !important;
-  --channeltextarea-background: var(--midnight-bg-3) !important;
 
+  --text-primary: var(--midnight-text-1) !important;
+  --text-secondary: var(--midnight-text-2) !important;
+  --text-primary-muted: var(--midnight-text-2) !important;
+  --text-tertiary: var(--midnight-text-3) !important;
   --text-normal: var(--midnight-text-1) !important;
   --text-muted: var(--midnight-text-3) !important;
   --text-link: var(--midnight-accent-1) !important;
-  --header-primary: var(--midnight-text-0) !important;
-  --header-secondary: var(--midnight-text-2) !important;
   --interactive-normal: var(--midnight-text-2) !important;
   --interactive-hover: var(--midnight-text-0) !important;
   --interactive-active: #ffffff !important;
-  --brand-experiment: var(--midnight-accent-2) !important;
-  --brand-experiment-500: var(--midnight-accent-2) !important;
+  --brand-primary: var(--midnight-accent-2) !important;
+  --brand-primary-light: var(--midnight-accent-1) !important;
+  --accent-signal: var(--midnight-accent-2) !important;
 }
 
 html[data-miccord-theme="midnight"] body,
 html[data-miccord-theme="midnight"] #root {
   background-color: #161a21 !important;
-  font-family: 'Figtree', sans-serif !important;
+  font-family: 'Figtree', var(--font-sans), sans-serif !important;
 }
 
-html[data-miccord-theme="midnight"] [class*="DMPageFrame_module__container"],
-html[data-miccord-theme="midnight"] [class*="ChannelMessages_module__scrollerContainer"],
-html[data-miccord-theme="midnight"] [class*="SettingsModalLayout_module__container"],
-html[data-miccord-theme="midnight"] [class*="ChannelInput_module__container"] {
+/* Micup's CSS-module classes are "Name.module__part___hash" (with a dot). */
+html[data-miccord-theme="midnight"] [class*="DMPageFrame.module__container"],
+html[data-miccord-theme="midnight"] [class*="ChannelMessages.module__scrollerContainer"],
+html[data-miccord-theme="midnight"] [class*="SettingsModalLayout.module__container"] {
   border-radius: 8px !important;
   border: 1px solid var(--midnight-border) !important;
 }
 
-html[data-miccord-theme="midnight"] [class*="ChannelInput_module__container"] {
-  background: var(--midnight-bg-3) !important;
-}
-
-html[data-miccord-theme="midnight"] button[class*="Button_module__button"][class*="primary"] {
+html[data-miccord-theme="midnight"] button[class*="Button.module__button"][class*="Button.module__primary"] {
   background: var(--midnight-accent-2) !important;
   border-radius: 8px !important;
 }
 
-html[data-miccord-theme="midnight"] button[class*="Button_module__button"][class*="primary"]:hover {
+html[data-miccord-theme="midnight"] button[class*="Button.module__button"][class*="Button.module__primary"]:hover {
   background: var(--midnight-accent-1) !important;
 }
-
-
 
 /* CallTimer: call duration next to the channel name in the voice panel */
 .miccord-call-timer {
